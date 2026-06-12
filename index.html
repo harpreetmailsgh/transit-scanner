@@ -1,0 +1,702 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Transit Scanner helps GO Transit riders view live vehicle locations, schedules, saved trips, and active ride reminders.">
+  <meta name="theme-color" content="#00853f">
+  <title>Transit Scanner - Live GO Transit Tracking</title>
+  <style>
+    :root {
+      --green: #00853f;
+      --green-dark: #005d2b;
+      --ink: #17211b;
+      --muted: #5c6861;
+      --line: #dfe7e2;
+      --soft: #f4f8f6;
+      --white: #ffffff;
+      --amber: #f3b23f;
+      --blue: #2d6cdf;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: var(--white);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      line-height: 1.55;
+    }
+
+    a {
+      color: inherit;
+    }
+
+    .shell {
+      width: min(1120px, calc(100% - 40px));
+      margin: 0 auto;
+    }
+
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.18);
+      background: rgba(0, 93, 43, 0.92);
+      backdrop-filter: blur(16px);
+      color: var(--white);
+    }
+
+    .nav {
+      display: flex;
+      min-height: 68px;
+      align-items: center;
+      justify-content: space-between;
+      gap: 24px;
+    }
+
+    .brand {
+      display: inline-flex;
+      align-items: center;
+      gap: 12px;
+      font-weight: 800;
+      text-decoration: none;
+      white-space: nowrap;
+    }
+
+    .brand img {
+      width: 42px;
+      height: 42px;
+      border-radius: 9px;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+    }
+
+    .nav-links {
+      display: flex;
+      align-items: center;
+      gap: 18px;
+      font-size: 15px;
+    }
+
+    .nav-links a {
+      color: rgba(255, 255, 255, 0.88);
+      text-decoration: none;
+    }
+
+    .hero {
+      min-height: 620px;
+      display: grid;
+      align-items: center;
+      background:
+        radial-gradient(circle at 78% 22%, rgba(243, 178, 63, 0.24), transparent 28%),
+        linear-gradient(135deg, var(--green) 0%, var(--green-dark) 72%);
+      color: var(--white);
+      overflow: hidden;
+    }
+
+    .hero-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.05fr) minmax(320px, 0.95fr);
+      gap: 48px;
+      align-items: center;
+      padding: 82px 0 66px;
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 18px;
+      color: rgba(255, 255, 255, 0.84);
+      font-size: 14px;
+      font-weight: 700;
+      letter-spacing: 0;
+      text-transform: uppercase;
+    }
+
+    .eyebrow::before {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      background: var(--amber);
+      content: "";
+    }
+
+    h1 {
+      max-width: 760px;
+      margin: 0;
+      font-size: clamp(44px, 7vw, 84px);
+      line-height: 0.96;
+      letter-spacing: 0;
+    }
+
+    .hero-copy {
+      max-width: 660px;
+      margin: 24px 0 0;
+      color: rgba(255, 255, 255, 0.9);
+      font-size: 21px;
+    }
+
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 14px;
+      margin-top: 32px;
+    }
+
+    .button {
+      display: inline-flex;
+      min-height: 48px;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      border: 1px solid transparent;
+      border-radius: 8px;
+      padding: 12px 18px;
+      font-weight: 800;
+      text-decoration: none;
+      transition: transform 160ms ease, background 160ms ease, border-color 160ms ease;
+    }
+
+    .button:hover {
+      transform: translateY(-1px);
+    }
+
+    .button.primary {
+      background: var(--white);
+      color: var(--green-dark);
+    }
+
+    .button.secondary {
+      border-color: rgba(255, 255, 255, 0.34);
+      color: var(--white);
+    }
+
+    .phone {
+      position: relative;
+      width: min(390px, 100%);
+      margin: 0 auto;
+      border: 12px solid #102019;
+      border-radius: 38px;
+      background: #101816;
+      box-shadow: 0 28px 70px rgba(0, 0, 0, 0.32);
+      aspect-ratio: 9 / 18.4;
+      overflow: hidden;
+    }
+
+    .phone::before {
+      position: absolute;
+      top: 14px;
+      left: 50%;
+      z-index: 2;
+      width: 92px;
+      height: 24px;
+      border-radius: 999px;
+      background: #101816;
+      transform: translateX(-50%);
+      content: "";
+    }
+
+    .screen {
+      position: absolute;
+      inset: 0;
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      background: linear-gradient(180deg, #eef8f2 0%, #ffffff 42%);
+      color: var(--ink);
+    }
+
+    .map {
+      position: relative;
+      height: 58%;
+      min-height: 310px;
+      background:
+        linear-gradient(36deg, transparent 0 46%, rgba(0, 133, 63, 0.12) 47% 53%, transparent 54%),
+        linear-gradient(112deg, transparent 0 42%, rgba(45, 108, 223, 0.16) 43% 48%, transparent 49%),
+        linear-gradient(0deg, rgba(255,255,255,0.7), rgba(255,255,255,0.7)),
+        #dfeee7;
+      overflow: hidden;
+    }
+
+    .route {
+      position: absolute;
+      left: 16%;
+      right: 12%;
+      top: 46%;
+      height: 12px;
+      border-radius: 999px;
+      background: var(--green);
+      transform: rotate(-12deg);
+      box-shadow: 0 0 0 5px rgba(0, 133, 63, 0.14);
+    }
+
+    .pin {
+      position: absolute;
+      width: 18px;
+      height: 18px;
+      border: 4px solid var(--white);
+      border-radius: 999px;
+      background: var(--green);
+      box-shadow: 0 8px 18px rgba(0, 0, 0, 0.18);
+    }
+
+    .pin.one { left: 25%; top: 39%; }
+    .pin.two { right: 21%; top: 49%; background: var(--amber); }
+    .pin.three { left: 44%; top: 61%; background: var(--blue); }
+
+    .panel {
+      margin: -54px 18px 16px;
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: rgba(255, 255, 255, 0.96);
+      box-shadow: 0 18px 36px rgba(0, 0, 0, 0.14);
+    }
+
+    .app-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      margin-bottom: 14px;
+    }
+
+    .app-title {
+      font-size: 18px;
+      font-weight: 900;
+    }
+
+    .status {
+      border-radius: 999px;
+      background: rgba(0, 133, 63, 0.12);
+      color: var(--green-dark);
+      padding: 4px 10px;
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .departure {
+      display: grid;
+      grid-template-columns: 52px 1fr auto;
+      gap: 12px;
+      align-items: center;
+      padding: 12px 0;
+      border-top: 1px solid var(--line);
+    }
+
+    .badge {
+      display: grid;
+      width: 52px;
+      height: 38px;
+      place-items: center;
+      border-radius: 8px;
+      background: var(--green);
+      color: var(--white);
+      font-size: 14px;
+      font-weight: 900;
+    }
+
+    .route-name {
+      font-weight: 850;
+    }
+
+    .route-meta,
+    .time-note {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .time {
+      color: var(--green-dark);
+      font-weight: 900;
+      text-align: right;
+    }
+
+    section {
+      padding: 76px 0;
+    }
+
+    .section-head {
+      max-width: 720px;
+      margin-bottom: 34px;
+    }
+
+    h2 {
+      margin: 0 0 12px;
+      color: var(--green-dark);
+      font-size: clamp(30px, 4vw, 48px);
+      line-height: 1.08;
+      letter-spacing: 0;
+    }
+
+    .section-head p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 18px;
+    }
+
+    .features {
+      background: var(--soft);
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 18px;
+    }
+
+    .card {
+      min-height: 210px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--white);
+      padding: 24px;
+      box-shadow: 0 8px 22px rgba(14, 47, 29, 0.06);
+    }
+
+    .icon {
+      display: grid;
+      width: 44px;
+      height: 44px;
+      place-items: center;
+      border-radius: 8px;
+      background: rgba(0, 133, 63, 0.12);
+      color: var(--green-dark);
+      font-weight: 900;
+    }
+
+    .card h3 {
+      margin: 18px 0 8px;
+      font-size: 21px;
+    }
+
+    .card p {
+      margin: 0;
+      color: var(--muted);
+    }
+
+    .split {
+      display: grid;
+      grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
+      gap: 42px;
+      align-items: start;
+    }
+
+    .check-list {
+      display: grid;
+      gap: 14px;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .check-list li {
+      position: relative;
+      padding-left: 34px;
+      color: var(--muted);
+      font-size: 17px;
+    }
+
+    .check-list li::before {
+      position: absolute;
+      left: 0;
+      top: 2px;
+      display: grid;
+      width: 22px;
+      height: 22px;
+      place-items: center;
+      border-radius: 999px;
+      background: var(--green);
+      color: var(--white);
+      content: "\2713";
+      font-size: 14px;
+      font-weight: 900;
+    }
+
+    .notice {
+      border-left: 4px solid var(--amber);
+      background: #fff8e8;
+      padding: 18px 20px;
+      color: #65460e;
+    }
+
+    .cta {
+      background: var(--green-dark);
+      color: var(--white);
+    }
+
+    .cta h2 {
+      color: var(--white);
+    }
+
+    .cta p {
+      max-width: 650px;
+      color: rgba(255, 255, 255, 0.84);
+      font-size: 18px;
+    }
+
+    footer {
+      border-top: 1px solid var(--line);
+      padding: 28px 0;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .foot {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      gap: 16px;
+    }
+
+    .foot a {
+      color: var(--green-dark);
+      font-weight: 700;
+      text-decoration: none;
+    }
+
+    @media (max-width: 860px) {
+      .nav {
+        align-items: flex-start;
+        flex-direction: column;
+        padding: 14px 0;
+        gap: 10px;
+      }
+
+      .nav-links {
+        width: 100%;
+        flex-wrap: wrap;
+        gap: 12px 16px;
+      }
+
+      .hero-grid,
+      .split {
+        grid-template-columns: 1fr;
+      }
+
+      .hero {
+        min-height: auto;
+      }
+
+      .hero-grid {
+        padding-top: 48px;
+      }
+
+      .phone {
+        max-width: 340px;
+      }
+
+      .grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media (max-width: 520px) {
+      .shell {
+        width: min(100% - 28px, 1120px);
+      }
+
+      .nav-links {
+        font-size: 14px;
+      }
+
+      .hero-copy {
+        font-size: 18px;
+      }
+
+      .actions,
+      .button {
+        width: 100%;
+      }
+
+      .button {
+        padding-inline: 14px;
+      }
+
+      section {
+        padding: 56px 0;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <nav class="shell nav" aria-label="Main navigation">
+      <a class="brand" href="./" aria-label="Transit Scanner home">
+        <img src="icon.png" alt="" width="42" height="42">
+        <span>Transit Scanner</span>
+      </a>
+      <div class="nav-links">
+        <a href="#features">Features</a>
+        <a href="#privacy">Privacy</a>
+        <a href="https://harpreetmailsgh.github.io/transit-scanner-support/">Support</a>
+        <a href="https://github.com/harpreetmailsgh/TrackTransit">GitHub</a>
+      </div>
+    </nav>
+  </header>
+
+  <main>
+    <section class="hero">
+      <div class="shell hero-grid">
+        <div>
+          <div class="eyebrow">Built for GO Transit riders</div>
+          <h1>Transit Scanner</h1>
+          <p class="hero-copy">Track GO Transit schedules, live vehicle information, saved trips, and active ride reminders from one focused commute app.</p>
+          <div class="actions">
+            <a class="button primary" href="https://apps.apple.com/ca/search?term=Transit%20Scanner" aria-label="Find Transit Scanner on the App Store">Find on App Store</a>
+            <a class="button secondary" href="https://harpreetmailsgh.github.io/transit-scanner-support/">Get Support</a>
+          </div>
+        </div>
+
+        <div class="phone" aria-label="Transit Scanner app preview">
+          <div class="screen">
+            <div class="map">
+              <div class="route"></div>
+              <div class="pin one"></div>
+              <div class="pin two"></div>
+              <div class="pin three"></div>
+            </div>
+            <div class="panel">
+              <div class="app-head">
+                <div class="app-title">Nearby departures</div>
+                <div class="status">Live</div>
+              </div>
+              <div class="departure">
+                <div class="badge">LW</div>
+                <div>
+                  <div class="route-name">Lakeshore West</div>
+                  <div class="route-meta">Union Station</div>
+                </div>
+                <div>
+                  <div class="time">6 min</div>
+                  <div class="time-note">On time</div>
+                </div>
+              </div>
+              <div class="departure">
+                <div class="badge">KI</div>
+                <div>
+                  <div class="route-name">Kitchener</div>
+                  <div class="route-meta">Mount Pleasant</div>
+                </div>
+                <div>
+                  <div class="time">18 min</div>
+                  <div class="time-note">Track 4</div>
+                </div>
+              </div>
+              <div class="departure">
+                <div class="badge">61</div>
+                <div>
+                  <div class="route-name">Richmond Hill bus</div>
+                  <div class="route-meta">Terminal stop</div>
+                </div>
+                <div>
+                  <div class="time">24 min</div>
+                  <div class="time-note">Updated</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="features" class="features">
+      <div class="shell">
+        <div class="section-head">
+          <h2>Commute details without the clutter.</h2>
+          <p>Transit Scanner is designed for the trip you are taking right now, while keeping saved routes and schedule context close by.</p>
+        </div>
+        <div class="grid">
+          <article class="card">
+            <div class="icon">RT</div>
+            <h3>Live transit view</h3>
+            <p>View available real-time vehicle positions, departure updates, and delay information for GO Transit routes.</p>
+          </article>
+          <article class="card">
+            <div class="icon">MAP</div>
+            <h3>Map-first browsing</h3>
+            <p>See nearby stops and route context on a clean map built for fast orientation.</p>
+          </article>
+          <article class="card">
+            <div class="icon">SAVE</div>
+            <h3>Saved trips</h3>
+            <p>Keep frequent routes and trips handy so your daily commute is only a tap away.</p>
+          </article>
+          <article class="card">
+            <div class="icon">FIND</div>
+            <h3>Stop and route search</h3>
+            <p>Search by stop, route, or destination and move quickly from results to trip detail.</p>
+          </article>
+          <article class="card">
+            <div class="icon">BELL</div>
+            <h3>Ride reminders</h3>
+            <p>Use optional active-ride alerts to help you prepare for your destination stop.</p>
+          </article>
+          <article class="card">
+            <div class="icon">OFF</div>
+            <h3>Local schedule cache</h3>
+            <p>Cached schedule data helps the app stay useful even when connectivity is uneven.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section id="privacy">
+      <div class="shell split">
+        <div class="section-head">
+          <h2>Private by design.</h2>
+          <p>Your saved routes and preferences stay local to your device in version 1.0. Location is used only for map position and active ride reminders when you grant permission.</p>
+        </div>
+        <div>
+          <ul class="check-list">
+            <li>No advertising tracking or third-party analytics.</li>
+            <li>No Transit Scanner account required.</li>
+            <li>Saved routes, searches, and preferences are stored locally.</li>
+            <li>Live transit data comes from public GO Transit and Metrolinx data services.</li>
+            <li>Location access can be disabled at any time in device settings.</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section class="features">
+      <div class="shell split">
+        <div class="section-head">
+          <h2>Independent GO Transit companion.</h2>
+          <p>Transit Scanner is built for riders, using public transit data to make trip details easier to scan.</p>
+        </div>
+        <div class="notice">
+          Transit Scanner is an independent app and is not affiliated with, endorsed by, or sponsored by Metrolinx or GO Transit.
+        </div>
+      </div>
+    </section>
+
+    <section class="cta">
+      <div class="shell">
+        <h2>Ready for your next GO trip?</h2>
+        <p>Transit Scanner is prepared for App Store submission. Use the support page for help, privacy details, and review contact information.</p>
+        <div class="actions">
+          <a class="button primary" href="https://apps.apple.com/ca/search?term=Transit%20Scanner">Find on App Store</a>
+          <a class="button secondary" href="https://harpreetmailsgh.github.io/transit-scanner-support/">Support</a>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="shell foot">
+      <div>Copyright 2026 Transit Scanner. All rights reserved.</div>
+      <div>
+        <a href="https://harpreetmailsgh.github.io/transit-scanner-support/">Support</a>
+        &nbsp;|&nbsp;
+        <a href="https://harpreetmailsgh.github.io/transit-scanner-support/#privacy">Privacy</a>
+        &nbsp;|&nbsp;
+        <a href="mailto:support@transitscanner.app">Contact</a>
+      </div>
+    </div>
+  </footer>
+</body>
+</html>

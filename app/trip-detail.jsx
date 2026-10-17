@@ -35,6 +35,7 @@ import {
   removeSavedTrip,
   saveTrip,
 } from '../services/savedTripsService';
+import { startForTrip, stopTracking, getActiveLiveSession } from '../services/liveActivityService';
 
 const GO_GREEN = '#00853F';
 const STATUS_DELAYED = '#D22F27';
@@ -291,6 +292,8 @@ export default function TripDetailScreen() {
   const [resolvedPattern, setResolvedPattern] = useState('');
   const [isSaving, setIsSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [tracking, setTracking] = useState(false);
+  const [trackBusy, setTrackBusy] = useState(false);
 
   const departureIsoForPlatform =
     scheduledDateTime || (Array.isArray(stops) && stops[0]?.arrival_date_time ? String(stops[0].arrival_date_time) : null);
@@ -407,6 +410,23 @@ export default function TripDetailScreen() {
 
   useEffect(() => {
     let mounted = true;
+    (async () => {
+      try {
+        const session = await getActiveLiveSession();
+        if (mounted) {
+          setTracking(!!(session && String(session.tripId) === String(tripId)));
+        }
+      } catch {
+        if (mounted) setTracking(false);
+      }
+    })();
+    return () => {
+      mounted = false;
+    };
+  }, [tripId]);
+
+  useEffect(() => {
+    let mounted = true;
     const loadPlatform = async () => {
       if (isBus || !fromStopId || !departureIsoForPlatform) {
         if (mounted) {
@@ -504,6 +524,34 @@ export default function TripDetailScreen() {
       }),
     [upcomingBlink],
   );
+
+  const handleTrackTrip = useCallback(async () => {
+    if (!tripId || trackBusy) return;
+
+    if (tracking) {
+      try {
+        await stopTracking();
+      } catch {
+        // stopTracking is best-effort; clear local state regardless
+      }
+      setTracking(false);
+      return;
+    }
+
+    setTrackBusy(true);
+    try {
+      const result = await startForTrip({ tripId, fromStopId, toStopId: toStopId || '' });
+      if (result && result.started === false) {
+        Alert.alert('Live trip tracking needs iOS 16.2 or later.');
+      } else {
+        setTracking(true);
+      }
+    } catch {
+      // startForTrip surfaces hard failures via { started: false }; stay untracked
+    } finally {
+      setTrackBusy(false);
+    }
+  }, [tripId, fromStopId, toStopId, tracking, trackBusy]);
 
   const handleSaveTrip = useCallback(async () => {
     if (!tripId || !fromStopId || isSaving) return;
@@ -688,16 +736,38 @@ export default function TripDetailScreen() {
           <Text style={styles.backText}>Back</Text>
         </TouchableOpacity>
 
-        <TouchableOpacity style={styles.saveBtn} onPress={handleSaveTrip} disabled={isSaving} activeOpacity={0.8}>
-          {isSaving ? (
-            <ActivityIndicator size="small" color={GO_GREEN} />
-          ) : (
-            <>
-              <MaterialIcons name={saved ? 'bookmark' : 'bookmark-border'} size={20} color={GO_GREEN} />
-              <Text style={styles.saveText}>{saved ? 'Saved' : 'Save'}</Text>
-            </>
-          )}
-        </TouchableOpacity>
+        <View style={styles.rightActions}>
+          {tripId ? (
+            <TouchableOpacity
+              style={[styles.trackBtn, tracking && styles.trackBtnActive]}
+              onPress={handleTrackTrip}
+              disabled={trackBusy}
+              activeOpacity={0.8}
+            >
+              {trackBusy ? (
+                <ActivityIndicator size="small" color="#fff" />
+              ) : (
+                <>
+                  <MaterialIcons name={tracking ? 'stop' : 'my-location'} size={20} color="#fff" />
+                  <Text style={styles.trackText}>
+                    {tracking ? 'Tracking ✓ — tap to stop' : 'Track this Trip'}
+                  </Text>
+                </>
+              )}
+            </TouchableOpacity>
+          ) : null}
+
+          <TouchableOpacity style={styles.saveBtn} onPress={handleSaveTrip} disabled={isSaving} activeOpacity={0.8}>
+            {isSaving ? (
+              <ActivityIndicator size="small" color={GO_GREEN} />
+            ) : (
+              <>
+                <MaterialIcons name={saved ? 'bookmark' : 'bookmark-border'} size={20} color={GO_GREEN} />
+                <Text style={styles.saveText}>{saved ? 'Saved' : 'Save'}</Text>
+              </>
+            )}
+          </TouchableOpacity>
+        </View>
       </View>
 
       <View style={styles.liveStatusBar}>
@@ -743,6 +813,10 @@ const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: '#f2f2f7' },
   topTint: { position: 'absolute', top: 0, left: 0, right: 0, height: 160, backgroundColor: '#eef8f2' },
   topActionsRow: { marginTop: 4, marginLeft: 12, marginRight: 12, marginBottom: 8, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  rightActions: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  trackBtn: { minWidth: 82, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 5, paddingHorizontal: 12, paddingVertical: 8, borderRadius: 999, backgroundColor: GO_GREEN, elevation: 3, shadowColor: '#000', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.12, shadowRadius: 4 },
+  trackBtnActive: { backgroundColor: '#B91C1C' },
+  trackText: { fontSize: 14, color: '#fff', fontWeight: '600' },
   liveStatusBar: {
     marginHorizontal: 12,
     marginBottom: 10,

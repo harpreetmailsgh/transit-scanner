@@ -13,6 +13,7 @@ import { Ionicons } from '@expo/vector-icons';
 
 import DepartureListRow from '../../components/DepartureListRow';
 import { getLiveDepartures } from '../../services/gtfsRealtimeService';
+import { maybeAskForReview } from '../../services/reviewPrompt';
 
 const GO_GREEN = '#00853F';
 
@@ -39,6 +40,9 @@ export default function DeparturesScreen() {
     const deps = getLiveDepartures(stopId, 100, { mode });
     setDepartures(Array.isArray(deps) ? deps : []);
     setLoading(false);
+    if (Array.isArray(deps) && deps.length > 0) {
+      maybeAskForReview();
+    }
   }, [stopId, stopFilter]);
 
   const subtitle = useMemo(() => {

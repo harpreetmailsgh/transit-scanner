@@ -357,6 +357,16 @@ export default function HomeScreen() {
   const msSinceLastProgress = nowTick - (lastProgressAt || loadStartAt || nowTick);
   const stalled = shouldShowStartup && msSinceLastProgress >= STALLED_HINT_DELAY_MS;
   const loadingFromCache = /loading cached go transit data/i.test(progressMessage || '');
+  const stopsSourceLabel =
+    (
+      {
+        api: 'live',
+        cache: 'saved',
+        'static-fallback': 'bundled',
+        'static-warmup': 'bundled',
+        'static-schedule': 'bundled',
+      }[stopsSource]
+    ) || 'startup';
   const startupDetailText = loadingFromCache
     ? 'Loading schedules already saved on this phone.'
     : 'Downloading or rebuilding GO Transit schedules on this phone.';
@@ -454,7 +464,7 @@ export default function HomeScreen() {
         <View style={styles.syncBanner}>
           <View style={styles.syncBannerRow}>
             <Text style={styles.syncBannerText}>
-              Stops are ready from {stopsSource || 'startup'} data. Schedules are syncing in background.
+              Stops are ready from {stopsSourceLabel} data. Schedules are syncing in background.
             </Text>
           </View>
         </View>

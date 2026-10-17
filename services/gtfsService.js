@@ -103,6 +103,8 @@ let schedulesReadyFlag = false;
 let loadGeneration = 0;
 /** Tracks which date/mode schedule slices are in memory (`ymd:train` / `ymd:bus`). */
 const loadedScheduleKeys = new Set();
+/** O(1) dedup for appended stop_time rows: `trip_id|stop_id|stop_sequence|arrival|departure`. */
+const indexedStopTimeKeys = new Set();
 /** Serializes lazy schedule loads so overlapping screens cannot append duplicate stop_times. */
 let scheduleLoadQueue = Promise.resolve();
 /** Cached bundle meta from hosted SQLite download. */
@@ -333,6 +335,7 @@ export function clearLoadedScheduleKeys() {
   stopTimesByTripId = new Map();
   tripsById = new Map();
   routeTypesByStopId = new Map();
+  indexedStopTimeKeys.clear();
 }
 
 function addDaysYmd(ymd, days) {
@@ -837,22 +840,37 @@ function appendStopTimeRowToIndexes(st) {
 
   if (!stopTimesByTripId.has(tid)) stopTimesByTripId.set(tid, []);
   stopTimesByTripId.get(tid).push(st);
+
+  // Keep the dedup Set mirroring the maps no matter which append path ran
+  // (the CSV cold-download path appends here directly, with no dedup check).
+  indexedStopTimeKeys.add(buildStopTimeRowKey(st));
 }
 
-function hasIndexedStopTimeRow(st) {
+/**
+ * Pure dedup key for a stop_time row. Field-for-field identical to the old
+ * linear scan's comparison: trip_id (with `|| ''`), stop_id, stop_sequence
+ * (note: no `|| ''` on these two, so `undefined` stringifies — matching
+ * `String(undefined)`), arrival_time and departure_time (with `|| ''`).
+ */
+export function buildStopTimeRowKey(st) {
+  return `${String(st?.trip_id || '')}|${String(st.stop_id)}|${String(st.stop_sequence)}|${String(st.arrival_time || '')}|${String(st.departure_time || '')}`;
+}
+
+/**
+ * Appends one stop_time row unless an identical row is already indexed.
+ * Returns true when the row was skipped as a duplicate.
+ * Replicates the old scan semantics exactly, including the empty-trip_id
+ * case (always appended, never deduped).
+ */
+function tryIndexStopTimeRow(st) {
   const tid = String(st?.trip_id || '');
-  if (!tid) return false;
-  const rows = stopTimesByTripId.get(tid);
-  if (!rows?.length) return false;
-  const sid = String(st.stop_id);
-  const seq = String(st.stop_sequence);
-  return rows.some(
-    (row) =>
-      String(row.stop_id) === sid &&
-      String(row.stop_sequence) === seq &&
-      String(row.arrival_time || '') === String(st.arrival_time || '') &&
-      String(row.departure_time || '') === String(st.departure_time || ''),
-  );
+  if (!tid) {
+    appendStopTimeRowToIndexes(st);
+    return false;
+  }
+  if (indexedStopTimeKeys.has(buildStopTimeRowKey(st))) return true;
+  appendStopTimeRowToIndexes(st);
+  return false;
 }
 
 async function finalizeStopTimeTripIndexes() {
@@ -900,6 +918,42 @@ async function rebuildRouteTypesByStopId() {
   }
 }
 
+/**
+ * Incremental version of rebuildRouteTypesByStopId: indexes only the given
+ * batch instead of rescanning every loaded trip and row. The accumulated
+ * state is identical to a full rebuild because routeTypesByStopId only ever
+ * grows (Sets are add-only) and is reset at the same points as the row maps.
+ */
+async function indexRouteTypesForBatch(trips, stopTimesRows) {
+  const routeTypeByTripId = new Map();
+  let tripsSeen = 0;
+  for (const trip of trips || []) {
+    const route = routesById.get(String(trip.route_id));
+    const routeType = Number(route?.route_type);
+    if (!Number.isNaN(routeType)) {
+      routeTypeByTripId.set(String(trip.trip_id), routeType);
+    }
+    tripsSeen += 1;
+    if (tripsSeen % 1200 === 0) {
+      await yieldToJsLoop();
+    }
+  }
+
+  let rowsProcessed = 0;
+  for (const st of stopTimesRows || []) {
+    const routeType = routeTypeByTripId.get(String(st.trip_id));
+    if (routeType === undefined) continue;
+
+    const sid = String(st.stop_id);
+    if (!routeTypesByStopId.has(sid)) routeTypesByStopId.set(sid, new Set());
+    routeTypesByStopId.get(sid).add(routeType);
+    rowsProcessed += 1;
+    if (rowsProcessed % YIELD_INDEX_INTERVAL === 0) {
+      await yieldToJsLoop();
+    }
+  }
+}
+
 async function hydrateCoreData(data) {
   stopsById = new Map((data.stops || []).map((s) => [String(s.stop_id), s]));
   routesById = new Map((data.routes || []).map((r) => [String(r.route_id), r]));
@@ -907,6 +961,7 @@ async function hydrateCoreData(data) {
   stopTimesByStopId = new Map();
   stopTimesByTripId = new Map();
   routeTypesByStopId = new Map();
+  indexedStopTimeKeys.clear();
   pathways = data.pathways || [];
   calendarRows = data.calendar || [];
   calendarDatesRows = data.calendarDates || [];
@@ -920,14 +975,13 @@ async function appendScheduleData(trips, stopTimes) {
   }
   let rowsProcessed = 0;
   for (const st of stopTimes || []) {
-    if (hasIndexedStopTimeRow(st)) continue;
-    appendStopTimeRowToIndexes(st);
+    if (tryIndexStopTimeRow(st)) continue;
     rowsProcessed += 1;
     if (rowsProcessed % YIELD_INDEX_INTERVAL === 0) {
       await yieldToJsLoop();
     }
   }
-  await rebuildRouteTypesByStopId();
+  await indexRouteTypesForBatch(trips, stopTimes);
 }
 
 async function hydrateFromPlainObject(data) {
@@ -1354,6 +1408,8 @@ async function downloadAndParseZip(onProgress, options = {}) {
 
   stopTimesByStopId = new Map();
   stopTimesByTripId = new Map();
+  routeTypesByStopId = new Map();
+  indexedStopTimeKeys.clear();
   const stopTimes = await withStageTimeout(
     'parse stop_times',
     () =>
@@ -1372,7 +1428,7 @@ async function downloadAndParseZip(onProgress, options = {}) {
   stopsById = new Map(stops.map((s) => [s.stop_id, s]));
   routesById = new Map(routes.map((r) => [r.route_id, r]));
   tripsById = new Map(trips.map((t) => [t.trip_id, t]));
-  await withStageTimeout('build route type index', () => rebuildRouteTypesByStopId(), STAGE_INDEX_TIMEOUT_MS);
+  await withStageTimeout('build route type index', () => indexRouteTypesForBatch(trips, stopTimes), STAGE_INDEX_TIMEOUT_MS);
   markStage('indexes-built');
 
   // Shapes skipped — no polylines built (saves memory; route lines not shown in UI).

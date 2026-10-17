@@ -60,44 +60,68 @@ async function writeCachedStops(stops) {
   }
 }
 
+async function fetchAndCacheApiStops(trace) {
+  const fetchStartedAt = Date.now();
+  try {
+    trace('stops bootstrap: fetching API');
+    const res = await fetchWithTimeout(STOPS_API_URL, STOPS_API_TIMEOUT_MS);
+    if (!res.ok) {
+      throw new Error(`Stops API failed: HTTP ${res.status}`);
+    }
+    const json = await res.json();
+    const stops = normalizeStopsPayload(json);
+    if (stops.length) {
+      await writeCachedStops(stops);
+      return {
+        stops,
+        source: 'api',
+        fetchMs: Date.now() - fetchStartedAt,
+      };
+    }
+    throw new Error('Stops API payload did not include any valid stops.');
+  } catch (err) {
+    trace('stops bootstrap: API unavailable', { message: err?.message });
+    return null;
+  }
+}
+
 export async function loadBootstrapStops(options = {}) {
   const { onTrace } = options;
   const trace = (msg, extra) => {
     if (typeof onTrace === 'function') onTrace(msg, extra);
   };
 
-  if (USE_API_STOPS_BOOTSTRAP && STOPS_API_URL) {
-    const fetchStartedAt = Date.now();
-    try {
-      trace('stops bootstrap: fetching API');
-      const res = await fetchWithTimeout(STOPS_API_URL, STOPS_API_TIMEOUT_MS);
-      if (!res.ok) {
-        throw new Error(`Stops API failed: HTTP ${res.status}`);
-      }
-      const json = await res.json();
-      const stops = normalizeStopsPayload(json);
-      if (stops.length) {
-        await writeCachedStops(stops);
-        return {
-          stops,
-          source: 'api',
-          fetchMs: Date.now() - fetchStartedAt,
-        };
-      }
-      throw new Error('Stops API payload did not include any valid stops.');
-    } catch (err) {
-      trace('stops bootstrap: API unavailable, trying cache', { message: err?.message });
-    }
-  }
-
+  // Cache-first: return instantly when we have saved stops; refresh the
+  // cache in the background so the next launch is fresh. The API attempt
+  // used to block startup for up to 8s on slow networks.
   const cachedStops = await readCachedStops();
   if (cachedStops.length) {
+    if (USE_API_STOPS_BOOTSTRAP && STOPS_API_URL) {
+      fetchAndCacheApiStops(trace).catch(() => {
+        // Best-effort background refresh; this launch uses the cache regardless.
+      });
+    }
     trace('stops bootstrap: loaded from cache');
     return {
       stops: cachedStops,
       source: 'cache',
       fetchMs: 0,
     };
+  }
+
+  if (USE_API_STOPS_BOOTSTRAP && STOPS_API_URL) {
+    const apiResult = await fetchAndCacheApiStops(trace);
+    if (apiResult) return apiResult;
+    trace('stops bootstrap: API unavailable, trying cache', { message: 'cache was empty on first read' });
+    const retryCached = await readCachedStops();
+    if (retryCached.length) {
+      trace('stops bootstrap: loaded from cache');
+      return {
+        stops: retryCached,
+        source: 'cache',
+        fetchMs: 0,
+      };
+    }
   }
 
   const staticStops = getStops();

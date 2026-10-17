@@ -659,7 +659,7 @@ export default function SearchScreen() {
   if (error) {
     return (
       <SafeAreaView style={styles.center} edges={['bottom', 'left', 'right']}>
-        <Text style={styles.errorText}>{error}</Text>
+        <Text style={styles.errorText}>Couldn't load transit schedules. Please try again.</Text>
       </SafeAreaView>
     );
   }

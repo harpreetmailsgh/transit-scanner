@@ -24,6 +24,7 @@ import {
 import { resumeRideTracking } from '../services/rideTrackingService';
 import { reconcileOnLaunch, refreshFromFeed } from '../services/liveActivityService';
 import { initAutoStart } from '../services/tripAutoStartService';
+import { reportStartupTiming } from '../services/startupTelemetry';
 
 /**
  * If loading takes longer than this, we fail with a visible error.
@@ -101,6 +102,7 @@ export function GtfsDataProvider({ children }) {
   const progressPercentRef = useRef(0);
   const startupTraceRef = useRef([]);
   const finishedRef = useRef(false);
+  const telemetryReportedRef = useRef(false);
 
   const appendStartupTrace = React.useCallback((line) => {
     const timestamp = new Date().toISOString();
@@ -144,6 +146,7 @@ export function GtfsDataProvider({ children }) {
     setDebugLogPath(null);
     setDebugLogCaptured(false);
     finishedRef.current = false;
+    telemetryReportedRef.current = false;
     startupTraceRef.current = [];
     appendStartupTrace('load started');
     syncServiceDiagnostics();
@@ -182,6 +185,9 @@ export function GtfsDataProvider({ children }) {
         } catch (bootstrapErr) {
           appendStartupTrace(`-- | stops bootstrap unavailable (${bootstrapErr?.message || 'unknown error'})`);
         }
+
+        // Telemetry: stops phase done (silent, backend only).
+        const stopsDoneAt = Date.now();
 
         phasePollId = setInterval(() => {
           if (!cancelled) syncServiceDiagnostics();
@@ -266,6 +272,9 @@ export function GtfsDataProvider({ children }) {
           stallPromise,
         ]);
 
+        // Telemetry: schedules phase done (silent, backend only).
+        const schedulesDoneAt = Date.now();
+
         if (!cancelled) {
           if (!localStopsReady) {
             const scheduleStops = getStaticStops();
@@ -293,6 +302,16 @@ export function GtfsDataProvider({ children }) {
           appendStartupTrace('100% | ready');
           setSchedulesReady(true);
           setReady(true);
+          // Telemetry: one silent backend report per successful ready (no UI).
+          if (!telemetryReportedRef.current) {
+            telemetryReportedRef.current = true;
+            const readyAt = Date.now();
+            reportStartupTiming({
+              totalMs: readyAt - startedAt,
+              stopsMs: stopsDoneAt - startedAt,
+              schedulesMs: schedulesDoneAt - stopsDoneAt,
+            }).catch(() => {});
+          }
           finishedRef.current = true;
         }
       } catch (e) {

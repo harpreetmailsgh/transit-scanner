@@ -20,6 +20,7 @@ import {
   checkHostedSqliteUpdate,
   clearPendingHostedSqliteUpdate,
   ensureHostedSqlite,
+  ensureLocalHostedSqlite,
   getBundleMeta,
   getEffectiveCoverageEnd,
   getPendingHostedSqliteUpdate,
@@ -1580,18 +1581,31 @@ async function loadFromHostedSqlite(onProgress, options = {}) {
   setStartupPhase('sqlite-download', 'Preparing hosted schedules database');
   emitProgress(onProgress, 'Checking schedules database...', 0.02);
 
-  const ensured = await ensureHostedSqlite({
-    force: !!options.forceDownload,
-    onProgress: (event) => {
-      if (!event) return;
-      const msg = typeof event === 'string' ? event : event.message;
-      const pct = typeof event === 'object' ? Number(event.percent) : NaN;
-      emitProgress(onProgress, msg || 'Downloading schedules database...', Number.isFinite(pct) ? pct : undefined);
-    },
-  });
+  const ensureProgress = (event) => {
+    if (!event) return;
+    const msg = typeof event === 'string' ? event : event.message;
+    const pct = typeof event === 'object' ? Number(event.percent) : NaN;
+    emitProgress(onProgress, msg || 'Downloading schedules database...', Number.isFinite(pct) ? pct : undefined);
+  };
+
+  // Local-first: use the on-device database immediately so a slow or failing
+  // manifest fetch can't stall or fail startup. Version checks and downloads
+  // happen in the background update flow after the app is ready.
+  let ensured;
+  if (options.forceDownload) {
+    ensured = await ensureHostedSqlite({ force: true, onProgress: ensureProgress });
+  } else {
+    const local = await ensureLocalHostedSqlite().catch(() => ({
+      ok: false,
+      reason: 'local-ensure-failed',
+    }));
+    ensured = local?.ok
+      ? local
+      : await ensureHostedSqlite({ force: false, onProgress: ensureProgress });
+  }
 
   if (!ensured?.ok) {
-    throw new Error('Hosted schedules database is not configured.');
+    throw new Error(`Hosted schedules database unavailable (${ensured?.reason || 'unknown reason'}).`);
   }
 
   cachedBundleMeta = await getBundleMeta();

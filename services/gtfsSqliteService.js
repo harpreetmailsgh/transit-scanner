@@ -215,9 +215,9 @@ function createHostedSqliteError(stage, message, details = {}) {
   return error;
 }
 
-async function fetchRemoteManifest() {
+async function fetchRemoteManifest(timeoutMs = DEFAULT_TIMEOUT_MS) {
   if (MANIFEST_URL) {
-    const res = await fetchWithTimeout(MANIFEST_URL, DEFAULT_TIMEOUT_MS);
+    const res = await fetchWithTimeout(MANIFEST_URL, timeoutMs);
     if (!res.ok) {
       throw createHostedSqliteError('manifest-fetch', 'GTFS manifest fetch failed.', {
         url: MANIFEST_URL,
@@ -778,6 +778,94 @@ export function getMonthDateSpan(meta = null) {
   return { startDate: month.startDate, endDate: month.endDate };
 }
 
+/**
+ * Local-only variant of ensureHostedSqlite: validates the on-device schedule
+ * database(s) WITHOUT any network access. Used on the startup critical path
+ * so a slow/unreachable manifest fetch can't stall or fail app launch.
+ * Version checks and downloads stay in the background update flow.
+ * Never throws: returns {ok:false, reason} naming what's missing/invalid.
+ * NOTE: deliberately does NOT stamp checkedAt/lastCheckAt — that would reset
+ * the background update throttle in GtfsUpdateContext.
+ */
+export async function ensureLocalHostedSqlite() {
+  if (!hasAnyUrl()) {
+    return { ok: false, reason: 'not-configured' };
+  }
+
+  const validate = (dbName, tables, stopsRequired = false) =>
+    validateDbTables(dbName, tables, stopsRequired).catch((error) => ({
+      ok: false,
+      reason: error?.message || String(error),
+    }));
+
+  const bundleMeta = await readJson(BUNDLE_META_FILE);
+  if (bundleMeta?.format === 'v2') {
+    const localVersion = String(bundleMeta?.version || '');
+    if (!localVersion) {
+      return { ok: false, reason: 'local-version-missing' };
+    }
+    const coreInfo = await getFileInfo(CORE_DB_FILE);
+    if (!coreInfo?.exists) {
+      return { ok: false, reason: 'local-core-missing' };
+    }
+    const coreValidation = await validate(CORE_DB_NAME, ['stops', 'routes', 'calendar_dates'], true);
+    if (!coreValidation.ok) {
+      return { ok: false, reason: `local-core-invalid: ${coreValidation.reason || 'unknown'}` };
+    }
+    const monthInfo = await getFileInfo(MONTH_DB_FILE);
+    if (!monthInfo?.exists) {
+      return { ok: false, reason: 'local-month-missing' };
+    }
+    const monthValidation = await validate(MONTH_DB_NAME, ['trips', 'stop_times']);
+    if (!monthValidation.ok) {
+      return { ok: false, reason: `local-month-invalid: ${monthValidation.reason || 'unknown'}` };
+    }
+    // Prune invalid week DBs (mirrors ensureHostedBundleV2): a corrupt week
+    // file would otherwise crash schedule resolution at startup.
+    const validInstalledWeeks = [];
+    for (const week of bundleMeta.installedWeeks || []) {
+      const startDate = String(week?.startDate || '');
+      if (!startDate) continue;
+      const weekFile = weekDbFile(startDate);
+      const weekInfo = await getFileInfo(weekFile);
+      if (!weekInfo?.exists) continue;
+      const weekValidation = await validate(weekDbName(startDate), ['trips', 'stop_times']);
+      if (weekValidation.ok) {
+        validInstalledWeeks.push(week);
+      } else {
+        logHostedSqlite('bundle:v2:existing-week-invalid', {
+          weekFile,
+          validation: weekValidation,
+        });
+        await FileSystem.deleteAsync(weekFile, { idempotent: true }).catch(() => {});
+      }
+    }
+    if (validInstalledWeeks.length !== (bundleMeta.installedWeeks || []).length) {
+      await writeJson(BUNDLE_META_FILE, { ...bundleMeta, installedWeeks: validInstalledWeeks });
+    }
+    return { ok: true, changed: false, format: 'v2' };
+  }
+
+  const legacyMeta = await readJson(LEGACY_META_FILE);
+  const legacyVersion = String(legacyMeta?.version || '');
+  if (!legacyVersion) {
+    return { ok: false, reason: 'no-local-db' };
+  }
+  const legacyInfo = await getFileInfo(LEGACY_DB_FILE);
+  if (!legacyInfo?.exists) {
+    return { ok: false, reason: 'no-local-db' };
+  }
+  const legacyValidation = await validate(
+    LEGACY_DB_NAME,
+    ['stops', 'routes', 'trips', 'stop_times'],
+    true,
+  );
+  if (!legacyValidation.ok) {
+    return { ok: false, reason: `local-db-invalid: ${legacyValidation.reason || 'unknown'}` };
+  }
+  return { ok: true, changed: false, format: 'v1', dbPath: LEGACY_DB_FILE };
+}
+
 export async function ensureHostedSqlite(options = {}) {
   if (!hasAnyUrl()) {
     return { ok: false, reason: 'not-configured' };
@@ -830,7 +918,7 @@ export async function checkHostedSqliteUpdate() {
     return { status: 'not-configured', update: null };
   }
 
-  const manifest = await fetchRemoteManifest();
+  const manifest = await fetchRemoteManifest(4000);
   const bundleMeta = await readJson(BUNDLE_META_FILE);
   const legacyMeta = await readJson(LEGACY_META_FILE);
   const localMeta = bundleMeta || legacyMeta;

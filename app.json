@@ -30,6 +30,7 @@
         "UIBackgroundModes": [
           "location"
         ],
+        "NSSupportsLiveActivities": true,
         "ITSAppUsesNonExemptEncryption": false
       },
       "bundleIdentifier": "com.harpreetmails.transitscanner"
@@ -86,7 +87,8 @@
           "isIosBackgroundLocationEnabled": true
         }
       ],
-      "expo-sqlite"
+      "expo-sqlite",
+      "expo-live-activity"
     ],
     "extra": {
       "router": {},

@@ -13,6 +13,7 @@ function debugLog(...args) {
 
 import { getStopById, getTripStops } from './gtfsService';
 import * as gtfsRealtimeService from './gtfsRealtimeService';
+import { refreshFromFeed as refreshLiveActivityFromFeed } from './liveActivityService';
 
 const RIDE_SESSION_FILE = `${FileSystem.documentDirectory}active-ride-v1.json`;
 const LOCATION_TASK_NAME = 'transitscanner-active-ride-location-task';
@@ -389,6 +390,11 @@ async function processLocationUpdate(latitude, longitude) {
 if (!TaskManager.isTaskDefined(LOCATION_TASK_NAME)) {
   TaskManager.defineTask(LOCATION_TASK_NAME, async ({ data, error }) => {
     if (error) return;
+    // Live Activity refresh driver: a location tick is just a wakeup signal.
+    // GPS coordinates are ignored for display (feed-only). Never throws.
+    try {
+      await refreshLiveActivityFromFeed();
+    } catch {}
     const locations = data?.locations;
     if (!Array.isArray(locations) || !locations.length) return;
 

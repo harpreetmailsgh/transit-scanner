@@ -22,6 +22,7 @@ import {
   stopRealtimeUpdates,
 } from '../services/gtfsRealtimeService';
 import { resumeRideTracking } from '../services/rideTrackingService';
+import { reconcileOnLaunch, refreshFromFeed } from '../services/liveActivityService';
 
 /**
  * If loading takes longer than this, we fail with a visible error.
@@ -124,6 +125,7 @@ export function GtfsDataProvider({ children }) {
 
   useEffect(() => {
     let cancelled = false;
+    let liveRefreshTimer = null;
     const startedAt = Date.now();
 
     setReady(false);
@@ -272,6 +274,14 @@ export function GtfsDataProvider({ children }) {
             localStopsReady = true;
           }
           startRealtimeUpdates();
+          // Live Activity: reconcile any orphaned activity from a previous
+          // run, then keep the active one fresh on a 60s tick (the service
+          // itself throttles native updates to max once per 60s).
+          reconcileOnLaunch().catch(() => {});
+          if (liveRefreshTimer) clearInterval(liveRefreshTimer);
+          liveRefreshTimer = setInterval(() => {
+            refreshFromFeed().catch(() => {});
+          }, 60000);
           setProgressPercent(1);
           progressPercentRef.current = 1;
           setProgressMessage('Ready');
@@ -344,6 +354,7 @@ export function GtfsDataProvider({ children }) {
     return () => {
       cancelled = true;
       clearTimeout(debugTimer);
+      if (liveRefreshTimer) clearInterval(liveRefreshTimer);
       stopRealtimeUpdates();
     };
   }, [appendStartupTrace, loadAttempt, syncServiceDiagnostics]);

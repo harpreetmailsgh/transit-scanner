@@ -23,6 +23,7 @@ import {
 } from '../services/gtfsRealtimeService';
 import { resumeRideTracking } from '../services/rideTrackingService';
 import { reconcileOnLaunch, refreshFromFeed } from '../services/liveActivityService';
+import { initAutoStart } from '../services/tripAutoStartService';
 
 /**
  * If loading takes longer than this, we fail with a visible error.
@@ -278,6 +279,9 @@ export function GtfsDataProvider({ children }) {
           // run, then keep the active one fresh on a 60s tick (the service
           // itself throttles native updates to max once per 60s).
           reconcileOnLaunch().catch(() => {});
+          // Smart auto-start: register station geofences for saved trips.
+          // No "Always" permission -> skips silently; manual tracking unaffected.
+          initAutoStart().catch(() => {});
           if (liveRefreshTimer) clearInterval(liveRefreshTimer);
           liveRefreshTimer = setInterval(() => {
             refreshFromFeed().catch(() => {});

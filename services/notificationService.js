@@ -128,6 +128,9 @@ export async function scheduleLocalNotification({ title, body, data = {} }) {
       sound: 'default',
       priority: Notifications.AndroidNotificationPriority.HIGH,
     },
-    trigger: null,
+    // Immediate delivery routed through the 'general' channel on Android.
+    // expo-notifications only applies channelId on Android; on iOS this
+    // parses to a null trigger, identical to `trigger: null`.
+    trigger: { channelId: 'general' },
   });
 }

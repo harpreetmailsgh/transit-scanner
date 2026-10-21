@@ -1,3 +1,4 @@
+import { Platform } from 'react-native';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Location from 'expo-location';
 import * as Notifications from 'expo-notifications';
@@ -158,8 +159,51 @@ async function sendRideNotification(title, body) {
       sound: 'default',
       priority: Notifications.AndroidNotificationPriority.HIGH,
     },
-    trigger: null,
+    // Immediate delivery routed through the 'ride-alerts' channel on Android.
+    // expo-notifications only applies channelId on Android; on iOS this
+    // parses to a null trigger, identical to `trigger: null`.
+    trigger: { channelId: 'ride-alerts' },
   });
+}
+
+// expo-location's Android failures are CodedExceptions: the JS error carries a
+// stable `code` inferred from the native exception class name
+// (expo-modules-core CodedException.inferCode). These codes mean "background
+// location capability is unavailable on this device/build" — the Android
+// counterpart of the iOS NSLocation failures that the two call sites below
+// have always treated as non-fatal (swallow / foreground fallback).
+const ANDROID_BACKGROUND_CAPABILITY_ERROR_CODES = new Set([
+  'ERR_LOCATION_BACKGROUND_UNAUTHORIZED', // LocationBackgroundUnauthorizedException
+  'ERR_NO_PERMISSION_IN_MANIFEST', // NoPermissionInManifestException
+  'ERR_LOCATION_UNAVAILABLE', // LocationUnavailableException (location services off)
+  'ERR_FOREGROUND_SERVICE_PERMISSIONS', // ForegroundServicePermissionsException
+  'ERR_FOREGROUND_SERVICE_START_NOT_ALLOWED', // ForegroundServiceStartNotAllowedException
+]);
+
+// Exact messages from expo-location's Android LocationExceptions.kt — used
+// only if an error arrives without its native code attached.
+const ANDROID_BACKGROUND_CAPABILITY_ERROR_MESSAGES = [
+  'Not authorized to use background location services',
+  'Location is unavailable.',
+  "Couldn't start the foreground service.",
+  'ACCESS_BACKGROUND_LOCATION` to the AndroidManifest',
+];
+
+// Decides whether a location failure means "background capability
+// unavailable" (swallow / foreground fallback) rather than a real error
+// (rethrow). On iOS this runs the exact message test the call sites have
+// always used; on Android it classifies by the native error code instead of
+// matching iOS error text.
+function isBackgroundCapabilityError(e, iosMessagePattern) {
+  const msg = e instanceof Error ? e.message : String(e || '');
+  if (Platform.OS === 'android') {
+    const code = e && typeof e === 'object' ? String(e.code || '') : '';
+    if (ANDROID_BACKGROUND_CAPABILITY_ERROR_CODES.has(code)) return true;
+    return ANDROID_BACKGROUND_CAPABILITY_ERROR_MESSAGES.some((fragment) =>
+      msg.includes(fragment),
+    );
+  }
+  return iosMessagePattern.test(msg);
 }
 
 async function requestTrackingPermissions() {
@@ -181,9 +225,8 @@ async function requestTrackingPermissions() {
     const bg = await Location.requestBackgroundPermissionsAsync();
     backgroundEnabled = bg.status === 'granted';
   } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e || '');
     // Expo Go / non-rebuilt iOS clients may not include background location plist keys.
-    if (!/NSLocation/i.test(msg)) {
+    if (!isBackgroundCapabilityError(e, /NSLocation/i)) {
       throw e;
     }
   }
@@ -233,8 +276,7 @@ async function startLocationTask(backgroundEnabled = true) {
       },
     });
   } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e || '');
-    if (!/NSLocation|background/i.test(msg)) {
+    if (!isBackgroundCapabilityError(e, /NSLocation|background/i)) {
       throw e;
     }
 

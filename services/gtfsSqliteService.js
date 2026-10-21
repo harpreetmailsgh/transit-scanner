@@ -18,6 +18,15 @@ const CORE_DB_FILE = joinPath(DB_OPEN_DIR, CORE_DB_NAME);
 const MONTH_DB_FILE = joinPath(DB_OPEN_DIR, MONTH_DB_NAME);
 const LEGACY_DB_FILE = joinPath(DB_OPEN_DIR, LEGACY_DB_NAME);
 
+// expo-file-system APIs take file:// URIs; DB_OPEN_DIR is a bare path, which
+// Android's native module rejects outright (iOS converts it silently). Keep
+// the bare *_DB_FILE paths ONLY for SQLite.openDatabaseAsync and diagnostics;
+// every FileSystem call uses these URI forms of the same real locations.
+const DB_FS_DIR = toFileUri(DB_DIR);
+const CORE_DB_URI = joinUri(DB_FS_DIR, CORE_DB_NAME);
+const MONTH_DB_URI = joinUri(DB_FS_DIR, MONTH_DB_NAME);
+const LEGACY_DB_URI = joinUri(DB_FS_DIR, LEGACY_DB_NAME);
+
 const BUNDLE_META_FILE = `${FileSystem.documentDirectory}go-gtfs-bundle-meta.json`;
 const LEGACY_META_FILE = `${FileSystem.documentDirectory}go-gtfs-v1-meta.json`;
 const SQLITE_UPDATE_FILE = `${FileSystem.documentDirectory}go-gtfs-v1-update.json`;
@@ -44,6 +53,13 @@ function joinUri(base, name) {
   const safeBase = String(base || '').replace(/\/?$/, '/');
   const safeName = String(name || '').replace(/^\/+/, '');
   return `${safeBase}${safeName}`;
+}
+
+function toFileUri(fsPath) {
+  const raw = String(fsPath || '');
+  if (!raw) return '';
+  if (/^[a-z][a-z0-9+.-]*:/i.test(raw)) return raw;
+  return `file://${raw.startsWith('/') ? '' : '/'}${raw}`;
 }
 
 function hasAnyUrl() {
@@ -246,11 +262,20 @@ async function fetchRemoteManifest(timeoutMs = DEFAULT_TIMEOUT_MS) {
 }
 
 async function ensureDbDirectory() {
-  await FileSystem.makeDirectoryAsync(DB_OPEN_DIR, { intermediates: true }).catch(() => {});
+  await FileSystem.makeDirectoryAsync(DB_FS_DIR, { intermediates: true }).catch((err) => {
+    logHostedSqlite('ensureDbDirectory:mkdir-failed', {
+      dir: DB_FS_DIR,
+      error: err?.message || String(err),
+    });
+  });
+  // Stray files an old build created by concatenating the DB name directly
+  // onto DB_OPEN_DIR with no separator (e.g. ".../SQLitego-gtfs-core.sqlite").
+  // Same target locations as before, in URI form so the delete actually runs
+  // on Android — these are NOT the real DB files, which live inside DB_FS_DIR.
   const malformedLegacyFiles = [
-    `${DB_OPEN_DIR}${CORE_DB_NAME}`,
-    `${DB_OPEN_DIR}${MONTH_DB_NAME}`,
-    `${DB_OPEN_DIR}${LEGACY_DB_NAME}`,
+    `${toFileUri(DB_OPEN_DIR)}${CORE_DB_NAME}`,
+    `${toFileUri(DB_OPEN_DIR)}${MONTH_DB_NAME}`,
+    `${toFileUri(DB_OPEN_DIR)}${LEGACY_DB_NAME}`,
   ];
   for (const path of malformedLegacyFiles) {
     await FileSystem.deleteAsync(path, { idempotent: true }).catch(() => {});
@@ -366,7 +391,8 @@ async function downloadFile(dbUrl, destPath, onProgress, label = 'schedules') {
 
 async function validateDbTables(dbName, requiredTables, stopsRequired = false) {
   const dbFile = joinPath(DB_OPEN_DIR, dbName);
-  const beforeOpenInfo = await getFileInfo(dbFile);
+  const dbUri = toFileUri(dbFile);
+  const beforeOpenInfo = await getFileInfo(dbUri);
   if (!beforeOpenInfo?.exists || Number(beforeOpenInfo?.size || 0) <= 0) {
     return {
       ok: false,
@@ -384,7 +410,7 @@ async function validateDbTables(dbName, requiredTables, stopsRequired = false) {
   try {
     const rows = await db.getAllAsync("SELECT name FROM sqlite_master WHERE type = 'table'");
     const tableNames = new Set((rows || []).map((row) => String(row?.name || '')));
-    const dbFileInfo = await getFileInfo(dbFile);
+    const dbFileInfo = await getFileInfo(dbUri);
     const missing = requiredTables.filter((table) => !tableNames.has(table));
     logHostedSqlite('validate: tables', {
       dbName,
@@ -461,6 +487,10 @@ function weekDbFile(startDate) {
   return joinPath(DB_OPEN_DIR, weekDbName(startDate));
 }
 
+function weekDbUri(startDate) {
+  return joinUri(DB_FS_DIR, weekDbName(startDate));
+}
+
 function computeEffectiveCoverageEnd(meta) {
   const monthEnd = String(meta?.month?.endDate || '');
   let maxEnd = monthEnd;
@@ -503,13 +533,13 @@ async function downloadLegacyDb(manifest, onProgress) {
     expectedSizeBytes: manifest.sizeBytes,
     checksumSha256: manifest.checksumSha256,
   });
-  await downloadFile(manifest.dbUrl, LEGACY_DB_FILE, onProgress, 'schedules database');
+  await downloadFile(manifest.dbUrl, LEGACY_DB_URI, onProgress, 'schedules database');
   if (manifest.sizeBytes > 0) {
-    const info = await FileSystem.getInfoAsync(LEGACY_DB_FILE);
+    const info = await FileSystem.getInfoAsync(LEGACY_DB_URI);
     const localSize = Number(info?.size || 0);
     const delta = Math.abs(localSize - manifest.sizeBytes);
     if (!info?.exists || delta > Math.max(4096, manifest.sizeBytes * 0.001)) {
-      await FileSystem.deleteAsync(LEGACY_DB_FILE, { idempotent: true }).catch(() => {});
+      await FileSystem.deleteAsync(LEGACY_DB_URI, { idempotent: true }).catch(() => {});
       throw createHostedSqliteError('legacy-download-size-mismatch', 'Downloaded schedules database size mismatch.', {
         expectedSizeBytes: manifest.sizeBytes,
         actualSizeBytes: localSize,
@@ -523,7 +553,7 @@ async function downloadLegacyDb(manifest, onProgress) {
     true,
   ).catch((error) => ({ ok: false, reason: error?.message || 'Validation failed.' }));
   if (!validation.ok) {
-    await FileSystem.deleteAsync(LEGACY_DB_FILE, { idempotent: true }).catch(() => {});
+    await FileSystem.deleteAsync(LEGACY_DB_URI, { idempotent: true }).catch(() => {});
     throw createHostedSqliteError('legacy-validation', `Downloaded schedules database is invalid. ${validation.reason}`, {
       dbPath: LEGACY_DB_FILE,
       validation,
@@ -567,8 +597,8 @@ async function ensureHostedBundleV2(manifest, options = {}) {
   const localVersion = String(meta?.version || '');
   const versionChanged = force || !localVersion || localVersion !== manifest.version;
 
-  const coreInfo = await getFileInfo(CORE_DB_FILE);
-  const monthInfo = await getFileInfo(MONTH_DB_FILE);
+  const coreInfo = await getFileInfo(CORE_DB_URI);
+  const monthInfo = await getFileInfo(MONTH_DB_URI);
   let needsCore = versionChanged || !coreInfo?.exists;
   let needsMonth = versionChanged || !monthInfo?.exists;
 
@@ -612,14 +642,14 @@ async function ensureHostedBundleV2(manifest, options = {}) {
   if (needsCore) {
     onProgress?.({ message: 'Downloading core schedules data...', percent: 0.06 });
     logHostedSqlite('bundle:v2:download-core', { coreUrl: manifest.core.url, coreFile: CORE_DB_FILE });
-    await downloadBundleAsset(manifest.core, CORE_DB_FILE, onProgress, 'core data');
+    await downloadBundleAsset(manifest.core, CORE_DB_URI, onProgress, 'core data');
     const coreValidation = await validateDbTables(
       CORE_DB_NAME,
       ['stops', 'routes', 'calendar_dates'],
       true,
     ).catch((error) => ({ ok: false, reason: error?.message }));
     if (!coreValidation.ok) {
-      await FileSystem.deleteAsync(CORE_DB_FILE, { idempotent: true }).catch(() => {});
+      await FileSystem.deleteAsync(CORE_DB_URI, { idempotent: true }).catch(() => {});
       logHostedSqlite('bundle:v2:core-validation-failed', { coreValidation, coreFile: CORE_DB_FILE });
       throw createHostedSqliteError('core-validation', `Core database invalid: ${coreValidation.reason}`, {
         coreFile: CORE_DB_FILE,
@@ -631,13 +661,13 @@ async function ensureHostedBundleV2(manifest, options = {}) {
   if (needsMonth) {
     onProgress?.({ message: 'Downloading monthly schedules...', percent: 0.35 });
     logHostedSqlite('bundle:v2:download-month', { monthUrl: manifest.month.url, monthFile: MONTH_DB_FILE });
-    await downloadBundleAsset(manifest.month, MONTH_DB_FILE, onProgress, 'monthly schedules');
+    await downloadBundleAsset(manifest.month, MONTH_DB_URI, onProgress, 'monthly schedules');
     const monthValidation = await validateDbTables(MONTH_DB_NAME, ['trips', 'stop_times']).catch((error) => ({
       ok: false,
       reason: error?.message,
     }));
     if (!monthValidation.ok) {
-      await FileSystem.deleteAsync(MONTH_DB_FILE, { idempotent: true }).catch(() => {});
+      await FileSystem.deleteAsync(MONTH_DB_URI, { idempotent: true }).catch(() => {});
       logHostedSqlite('bundle:v2:month-validation-failed', { monthValidation, monthFile: MONTH_DB_FILE });
       throw createHostedSqliteError('month-validation', `Month database invalid: ${monthValidation.reason}`, {
         monthFile: MONTH_DB_FILE,
@@ -651,7 +681,7 @@ async function ensureHostedBundleV2(manifest, options = {}) {
   for (const week of meta.installedWeeks || []) {
     const startDate = String(week?.startDate || '');
     if (!startDate) continue;
-    const weekFile = weekDbFile(startDate);
+    const weekFile = weekDbUri(startDate);
     const weekInfo = await getFileInfo(weekFile);
     if (!weekInfo?.exists) continue;
     const weekValidation = await validateDbTables(weekDbName(startDate), ['trips', 'stop_times']).catch(
@@ -677,7 +707,7 @@ async function ensureHostedBundleV2(manifest, options = {}) {
     for (const week of manifest.weeks || []) {
       const weekId = String(week.id || week.startDate || '');
       if (!weekId || installedWeekIds.has(weekId)) continue;
-      const dest = weekDbFile(week.startDate);
+      const dest = weekDbUri(week.startDate);
       onProgress?.({ message: `Downloading week ${week.startDate}...`, percent: 0.55 });
       await downloadBundleAsset(week, dest, onProgress, `week ${week.startDate}`);
       const weekValidation = await validateDbTables(weekDbName(week.startDate), ['trips', 'stop_times']).catch(
@@ -751,10 +781,10 @@ export function isHostedSqliteConfigured() {
 export async function getHostedSqlitePath() {
   const bundleMeta = await readJson(BUNDLE_META_FILE);
   if (bundleMeta?.format === 'v2') {
-    const core = await getFileInfo(CORE_DB_FILE);
+    const core = await getFileInfo(CORE_DB_URI);
     return core?.exists ? CORE_DB_FILE : null;
   }
-  const legacy = await getFileInfo(LEGACY_DB_FILE);
+  const legacy = await getFileInfo(LEGACY_DB_URI);
   return legacy?.exists ? LEGACY_DB_FILE : null;
 }
 
@@ -804,7 +834,7 @@ export async function ensureLocalHostedSqlite() {
     if (!localVersion) {
       return { ok: false, reason: 'local-version-missing' };
     }
-    const coreInfo = await getFileInfo(CORE_DB_FILE);
+    const coreInfo = await getFileInfo(CORE_DB_URI);
     if (!coreInfo?.exists) {
       return { ok: false, reason: 'local-core-missing' };
     }
@@ -812,7 +842,7 @@ export async function ensureLocalHostedSqlite() {
     if (!coreValidation.ok) {
       return { ok: false, reason: `local-core-invalid: ${coreValidation.reason || 'unknown'}` };
     }
-    const monthInfo = await getFileInfo(MONTH_DB_FILE);
+    const monthInfo = await getFileInfo(MONTH_DB_URI);
     if (!monthInfo?.exists) {
       return { ok: false, reason: 'local-month-missing' };
     }
@@ -826,7 +856,7 @@ export async function ensureLocalHostedSqlite() {
     for (const week of bundleMeta.installedWeeks || []) {
       const startDate = String(week?.startDate || '');
       if (!startDate) continue;
-      const weekFile = weekDbFile(startDate);
+      const weekFile = weekDbUri(startDate);
       const weekInfo = await getFileInfo(weekFile);
       if (!weekInfo?.exists) continue;
       const weekValidation = await validate(weekDbName(startDate), ['trips', 'stop_times']);
@@ -851,7 +881,7 @@ export async function ensureLocalHostedSqlite() {
   if (!legacyVersion) {
     return { ok: false, reason: 'no-local-db' };
   }
-  const legacyInfo = await getFileInfo(LEGACY_DB_FILE);
+  const legacyInfo = await getFileInfo(LEGACY_DB_URI);
   if (!legacyInfo?.exists) {
     return { ok: false, reason: 'no-local-db' };
   }
@@ -883,7 +913,7 @@ export async function ensureHostedSqlite(options = {}) {
   }
 
   const localMeta = await readJson(LEGACY_META_FILE);
-  const localInfo = await getFileInfo(LEGACY_DB_FILE);
+  const localInfo = await getFileInfo(LEGACY_DB_URI);
   const localVersion = String(localMeta?.version || '');
   const hasLocalDb = !!localInfo?.exists;
   let needsDownload =
@@ -1009,7 +1039,7 @@ export async function loadHostedCoreTables(onProgress) {
   const meta = await getBundleMeta();
   logHostedSqlite('load:core-start', { format: meta?.format, coreFile: CORE_DB_FILE });
   if (meta?.format === 'v2') {
-    const coreInfo = await getFileInfo(CORE_DB_FILE);
+    const coreInfo = await getFileInfo(CORE_DB_URI);
     if (!coreInfo?.exists) {
       throw createHostedSqliteError('load-core-missing', 'Core schedules database was not found on this device.', {
         coreFile: CORE_DB_FILE,
@@ -1042,7 +1072,7 @@ export async function loadHostedCoreTables(onProgress) {
     }
   }
 
-  const legacyInfo = await getFileInfo(LEGACY_DB_FILE);
+  const legacyInfo = await getFileInfo(LEGACY_DB_URI);
   if (!legacyInfo?.exists) {
     throw new Error('Schedules database was not found on this device.');
   }
@@ -1173,7 +1203,7 @@ export async function loadHostedSchedulesForDates(
     return { trips: allTrips, stopTimes: allStopTimes };
   }
 
-  const legacyInfo = await getFileInfo(LEGACY_DB_FILE);
+  const legacyInfo = await getFileInfo(LEGACY_DB_URI);
   if (!legacyInfo?.exists) {
     throw new Error('Schedules database was not found on this device.');
   }

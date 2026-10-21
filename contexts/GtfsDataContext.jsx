@@ -23,7 +23,7 @@ import {
   startRealtimeUpdates,
   stopRealtimeUpdates,
 } from '../services/gtfsRealtimeService';
-import { resumeRideTracking } from '../services/rideTrackingService';
+import { evaluateAlertsFromFeed, resumeRideTracking } from '../services/rideTrackingService';
 import { reconcileOnLaunch, refreshFromFeed } from '../services/liveActivityService';
 import { reportStartupTiming } from '../services/startupTelemetry';
 
@@ -319,6 +319,7 @@ export function GtfsDataProvider({ children }) {
           if (liveRefreshTimer) clearInterval(liveRefreshTimer);
           liveRefreshTimer = setInterval(() => {
             refreshFromFeed().catch(() => {});
+            evaluateAlertsFromFeed().catch(() => {});
           }, 60000);
           setProgressPercent(1);
           progressPercentRef.current = 1;

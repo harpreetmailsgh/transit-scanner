@@ -1,3 +1,22 @@
+/**
+ * Get-off alert service for Transit Scanner v1.2 (feed-driven engine, v2).
+ *
+ * Progression comes from the GTFS-RT feed — the exact same computeTripState
+ * the Live Activity card displays (services/liveActivityService.js) — so the
+ * card and the get-off alert can never disagree. The phone's GPS is never
+ * read for progression or gating: the user's tap on "Track this Trip" is
+ * the check (a tapped-but-never-boarded trip costs one stray buzz —
+ * accepted). GPS only wakes the app: the background location task and the
+ * foreground watcher are wake drivers whose ticks re-evaluate the feed.
+ *
+ * Session persistence: active-ride-v1.json in documentDirectory (same file
+ * as the retired GPS engine; sessions without engineVersion: 2 are legacy
+ * and are ended silently on load — never guessed at).
+ *
+ * Every public entry point never throws (UI-8): permission outcomes are
+ * reported as AlertState values, not errors.
+ */
+
 import { Platform } from 'react-native';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Location from 'expo-location';
@@ -12,18 +31,16 @@ function debugLog(...args) {
   } catch {}
 }
 
-import { getStopById, getTripStops } from './gtfsService';
-import * as gtfsRealtimeService from './gtfsRealtimeService';
-import { refreshFromFeed as refreshLiveActivityFromFeed } from './liveActivityService';
+import {
+  computeTripState,
+  getActiveLiveSession,
+  refreshFromFeed as refreshLiveActivityFromFeed,
+} from './liveActivityService';
 
 const RIDE_SESSION_FILE = `${FileSystem.documentDirectory}active-ride-v1.json`;
 const LOCATION_TASK_NAME = 'transitscanner-active-ride-location-task';
+const ENGINE_VERSION = 2;
 const DEFAULT_LEAD_STOPS = 1;
-const PROGRESS_ADVANCE_RADIUS_METERS = 1200;
-const STARTUP_BOOTSTRAP_MAX_DISTANCE_METERS = 3000;
-const CONFLICT_STREAK_TO_PAUSE = 2;
-const RESUME_STREAK_TO_RESUME = 2;
-const ADVANCE_STREAK_TO_PROGRESS = 2;
 const LOCATION_TIME_INTERVAL_MS = 15000;
 const LOCATION_DISTANCE_INTERVAL_M = 60;
 
@@ -34,27 +51,9 @@ function nowMs() {
   return Date.now();
 }
 
-function toRad(value) {
-  return (Number(value) * Math.PI) / 180;
-}
-
-function distanceMeters(aLat, aLon, bLat, bLon) {
-  const lat1 = Number(aLat);
-  const lon1 = Number(aLon);
-  const lat2 = Number(bLat);
-  const lon2 = Number(bLon);
-  if (![lat1, lon1, lat2, lon2].every(Number.isFinite)) return Number.POSITIVE_INFINITY;
-
-  const earthRadius = 6371000;
-  const dLat = toRad(lat2 - lat1);
-  const dLon = toRad(lon2 - lon1);
-  const p1 = toRad(lat1);
-  const p2 = toRad(lat2);
-  const h =
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos(p1) * Math.cos(p2) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
-  return 2 * earthRadius * Math.asin(Math.sqrt(h));
-}
+// ---------------------------------------------------------------------------
+// Session persistence
+// ---------------------------------------------------------------------------
 
 async function readSessionRaw() {
   try {
@@ -77,57 +76,48 @@ async function writeSessionRaw(session) {
   await FileSystem.writeAsStringAsync(RIDE_SESSION_FILE, JSON.stringify(session));
 }
 
-function normalizeActiveSession(session) {
-  if (!session || typeof session !== 'object') return null;
-  if (String(session.status || '') !== 'active') return null;
-  if (!String(session.tripId || '').trim()) return null;
-  if (!String(session.templateKey || '').trim()) return null;
-  if (!Array.isArray(session.stops) || !session.stops.length) return null;
-  return session;
+/**
+ * Loads the persisted alert session, normalized with defensive defaults.
+ * Returns null when there is no usable session — including legacy
+ * GPS-engine sessions (no engineVersion: 2), which are never guessed at.
+ * Side-effect free; migration cleanup lives in resumeRideTracking.
+ */
+async function loadAlertSession() {
+  const raw = await readSessionRaw();
+  if (!raw) return null;
+  if (raw.engineVersion !== ENGINE_VERSION) return null;
+  const status = String(raw.status ?? 'active');
+  if (status !== 'active') return null;
+  const tripId = String(raw.tripId || '').trim();
+  const fromStopId = String(raw.fromStopId || '').trim();
+  if (!tripId || !fromStopId) return null;
+
+  const leadRaw = Number(raw.leadStopsBefore);
+  return {
+    engineVersion: ENGINE_VERSION,
+    status: 'active',
+    tripId,
+    fromStopId,
+    toStopId: String(raw.toStopId || ''),
+    lineName: String(raw.lineName || 'GO'),
+    destinationName: String(raw.destinationName || ''),
+    departureLabel: raw.departureLabel ?? null,
+    leadStopsBefore:
+      Number.isFinite(leadRaw) && leadRaw >= 1 ? Math.floor(leadRaw) : DEFAULT_LEAD_STOPS,
+    alertState: ['setting-up', 'on', 'limited', 'off'].includes(raw.alertState)
+      ? raw.alertState
+      : 'off',
+    backgroundEnabled: Boolean(raw.backgroundEnabled ?? false),
+    staleFeed: Boolean(raw.staleFeed ?? false),
+    sentLeadAlert: Boolean(raw.sentLeadAlert ?? false),
+    startedAt: Number(raw.startedAt) || 0,
+    updatedAt: Number(raw.updatedAt) || 0,
+  };
 }
 
-function buildStopsWithCoords(tripId, fromStopId, toStopId) {
-  const stops = getTripStops(tripId, fromStopId, toStopId);
-  if (!Array.isArray(stops) || stops.length < 2) return [];
-
-  const withCoords = [];
-  for (let i = 0; i < stops.length; i += 1) {
-    const st = stops[i];
-    const stop = getStopById(st.stop_id);
-    const lat = Number(stop?.stop_lat);
-    const lon = Number(stop?.stop_lon);
-    if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
-    withCoords.push({
-      stopId: String(st.stop_id),
-      stopName: String(st.stop_name || stop?.stop_name || ''),
-      latitude: lat,
-      longitude: lon,
-      index: i,
-    });
-  }
-  return withCoords;
-}
-
-function getNearestUpcomingStopIndex(session, latitude, longitude) {
-  const destinationIndex = Number(session.destinationIndex);
-  let startIndex = Number(session.progressIndex);
-  if (!Number.isFinite(startIndex) || startIndex < 0) startIndex = 0;
-
-  let best = null;
-  for (const stop of session.stops) {
-    const idx = Number(stop.index);
-    if (!Number.isFinite(idx)) continue;
-    if (idx < startIndex) continue;
-    if (idx > destinationIndex) continue;
-
-    const dist = distanceMeters(latitude, longitude, stop.latitude, stop.longitude);
-    if (!Number.isFinite(dist)) continue;
-    if (!best || dist < best.dist) {
-      best = { idx, dist };
-    }
-  }
-  return best;
-}
+// ---------------------------------------------------------------------------
+// Notifications
+// ---------------------------------------------------------------------------
 
 async function ensureNotificationConfig() {
   if (notificationConfigured) return;
@@ -166,11 +156,16 @@ async function sendRideNotification(title, body) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Background-capability error classification (unchanged from the GPS era —
+// it classifies expo-location start/request failures, not progression)
+// ---------------------------------------------------------------------------
+
 // expo-location's Android failures are CodedExceptions: the JS error carries a
 // stable `code` inferred from the native exception class name
 // (expo-modules-core CodedException.inferCode). These codes mean "background
 // location capability is unavailable on this device/build" — the Android
-// counterpart of the iOS NSLocation failures that the two call sites below
+// counterpart of the iOS NSLocation failures that the call sites below
 // have always treated as non-fatal (swallow / foreground fallback).
 const ANDROID_BACKGROUND_CAPABILITY_ERROR_CODES = new Set([
   'ERR_LOCATION_BACKGROUND_UNAUTHORIZED', // LocationBackgroundUnauthorizedException
@@ -206,51 +201,88 @@ function isBackgroundCapabilityError(e, iosMessagePattern) {
   return iosMessagePattern.test(msg);
 }
 
-async function requestTrackingPermissions() {
-  const notif = await Notifications.getPermissionsAsync();
-  if (!notif.granted) {
-    const req = await Notifications.requestPermissionsAsync();
-    if (!req.granted) {
-      throw new Error('Notifications permission is required for get-off alerts.');
+// ---------------------------------------------------------------------------
+// Permissions — the fixed ladder. Never throws; outcomes are values.
+// Notifications denied or foreground location denied => 'off' (short-circuit:
+// no further prompts, no drivers). Background granted => 'on'; denied or
+// unavailable => 'limited' (foreground watcher only).
+// ---------------------------------------------------------------------------
+
+async function resolveAlertPermissions() {
+  let notificationsGranted = false;
+  try {
+    const current = await Notifications.getPermissionsAsync();
+    if (current.granted) {
+      notificationsGranted = true;
+    } else {
+      const requested = await Notifications.requestPermissionsAsync();
+      notificationsGranted = Boolean(requested.granted);
     }
+  } catch {
+    notificationsGranted = false;
+  }
+  if (!notificationsGranted) {
+    return { notificationsGranted: false, foregroundGranted: false, backgroundEnabled: false };
   }
 
-  const fg = await Location.requestForegroundPermissionsAsync();
-  if (fg.status !== 'granted') {
-    throw new Error('Foreground location permission is required to start ride tracking.');
+  let foregroundGranted = false;
+  try {
+    const fg = await Location.requestForegroundPermissionsAsync();
+    foregroundGranted = fg.status === 'granted';
+  } catch {
+    foregroundGranted = false;
+  }
+  if (!foregroundGranted) {
+    return { notificationsGranted: true, foregroundGranted: false, backgroundEnabled: false };
   }
 
   let backgroundEnabled = false;
   try {
     const bg = await Location.requestBackgroundPermissionsAsync();
     backgroundEnabled = bg.status === 'granted';
-  } catch (e) {
-    // Expo Go / non-rebuilt iOS clients may not include background location plist keys.
-    if (!isBackgroundCapabilityError(e, /NSLocation/i)) {
-      throw e;
-    }
+  } catch {
+    // Any failure here (capability or otherwise) means background location
+    // is unavailable on this device/build — the 'limited' outcome, never a throw.
+    backgroundEnabled = false;
   }
+  return { notificationsGranted: true, foregroundGranted: true, backgroundEnabled };
+}
 
-  return { backgroundEnabled };
+function alertStateForPermissions(perms) {
+  if (!perms.notificationsGranted || !perms.foregroundGranted) {
+    return { alertState: 'off', backgroundEnabled: false };
+  }
+  if (perms.backgroundEnabled) {
+    return { alertState: 'on', backgroundEnabled: true };
+  }
+  return { alertState: 'limited', backgroundEnabled: false };
+}
+
+// ---------------------------------------------------------------------------
+// Wake drivers. The background location task is SHARED with the Live
+// Activity card (it is the card's background refresh driver), so it is
+// stopped only when no live-activity session exists. The foreground watcher
+// belongs to this engine alone and always stops with the alert session.
+// ---------------------------------------------------------------------------
+
+async function startForegroundWatcher() {
+  if (foregroundLocationSubscription) return;
+  foregroundLocationSubscription = await Location.watchPositionAsync(
+    {
+      accuracy: Location.Accuracy.Balanced,
+      timeInterval: LOCATION_TIME_INTERVAL_MS,
+      distanceInterval: LOCATION_DISTANCE_INTERVAL_M,
+    },
+    () => {
+      // Fixes are a wake signal only — they gate and advance nothing.
+      onWakeTick().catch(() => {});
+    },
+  );
 }
 
 async function startLocationTask(backgroundEnabled = true) {
   if (!backgroundEnabled) {
-    if (!foregroundLocationSubscription) {
-      foregroundLocationSubscription = await Location.watchPositionAsync(
-        {
-          accuracy: Location.Accuracy.Balanced,
-          timeInterval: LOCATION_TIME_INTERVAL_MS,
-          distanceInterval: LOCATION_DISTANCE_INTERVAL_M,
-        },
-        (loc) => {
-          const latitude = loc?.coords?.latitude;
-          const longitude = loc?.coords?.longitude;
-          if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return;
-          processLocationUpdate(latitude, longitude).catch(() => {});
-        },
-      );
-    }
+    await startForegroundWatcher();
     return;
   }
 
@@ -279,302 +311,306 @@ async function startLocationTask(backgroundEnabled = true) {
     if (!isBackgroundCapabilityError(e, /NSLocation|background/i)) {
       throw e;
     }
+    await startForegroundWatcher();
+  }
+}
 
-    if (!foregroundLocationSubscription) {
-      foregroundLocationSubscription = await Location.watchPositionAsync(
-        {
-          accuracy: Location.Accuracy.Balanced,
-          timeInterval: LOCATION_TIME_INTERVAL_MS,
-          distanceInterval: LOCATION_DISTANCE_INTERVAL_M,
-        },
-        (loc) => {
-          const latitude = loc?.coords?.latitude;
-          const longitude = loc?.coords?.longitude;
-          if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return;
-          processLocationUpdate(latitude, longitude).catch(() => {});
-        },
-      );
+// Starts the drivers for a resolved alert state; driver failures are
+// swallowed so public entry points keep their never-throws contract.
+async function startDriversForState(alertState) {
+  try {
+    if (alertState === 'on') {
+      await startLocationTask(true);
+    } else if (alertState === 'limited') {
+      await startLocationTask(false);
     }
+  } catch (e) {
+    debugLog('startDriversForState failed', e);
   }
 }
 
 async function stopLocationTask() {
-  const started = await Location.hasStartedLocationUpdatesAsync(LOCATION_TASK_NAME);
-  if (!started) return;
-  await Location.stopLocationUpdatesAsync(LOCATION_TASK_NAME);
+  try {
+    const started = await Location.hasStartedLocationUpdatesAsync(LOCATION_TASK_NAME);
+    if (!started) return;
+    await Location.stopLocationUpdatesAsync(LOCATION_TASK_NAME);
+  } catch {}
 }
 
 async function stopForegroundWatcher() {
-  if (foregroundLocationSubscription) {
-    foregroundLocationSubscription.remove();
-    foregroundLocationSubscription = null;
+  try {
+    if (foregroundLocationSubscription) {
+      foregroundLocationSubscription.remove();
+      foregroundLocationSubscription = null;
+    }
+  } catch {}
+}
+
+async function hasLiveActivitySession() {
+  try {
+    const session = await getActiveLiveSession();
+    return Boolean(session);
+  } catch {
+    return false;
   }
 }
 
-async function processLocationUpdate(latitude, longitude) {
-  const current = normalizeActiveSession(await readSessionRaw());
-  if (!current) return;
-
-  debugLog('processLocationUpdate', { latitude, longitude, progressIndex: current.progressIndex, destinationIndex: current.destinationIndex });
-
-  const nearest = getNearestUpcomingStopIndex(current, latitude, longitude);
-
-  debugLog('Nearest upcoming stop', nearest);
-
-  const currentProgress = Number(current.progressIndex || 0);
-  const destinationIndex = Number(current.destinationIndex || 0);
-  const nextIndexCandidate = Number.isFinite(currentProgress)
-    ? Math.min(currentProgress + 1, destinationIndex)
-    : 1;
-  const hasConflict =
-    !nearest ||
-    (Number.isFinite(nextIndexCandidate) && Number(nearest.idx) > nextIndexCandidate + 1);
-  const hasAdvanceEvidence =
-    Boolean(nearest) &&
-    Number.isFinite(nextIndexCandidate) &&
-    Number(nearest.idx) >= nextIndexCandidate &&
-    Number(nearest.dist) <= PROGRESS_ADVANCE_RADIUS_METERS;
-
-  const next = {
-    ...current,
-    updatedAt: nowMs(),
-    lastKnownLatitude: Number(latitude),
-    lastKnownLongitude: Number(longitude),
-    lastKnownDistanceM: nearest && Number.isFinite(nearest.dist) ? Math.round(nearest.dist) : null,
-    liveTrackingPaused: Boolean(current.liveTrackingPaused),
-    conflictStreak: Number(current.conflictStreak || 0),
-    resumeStreak: Number(current.resumeStreak || 0),
-    advanceStreak: Number(current.advanceStreak || 0),
-  };
-
-  debugLog('Session after location update', next);
-
-  if (hasConflict) {
-    next.conflictStreak += 1;
-    next.resumeStreak = 0;
-    next.advanceStreak = 0;
-  } else {
-    next.conflictStreak = 0;
-    if (next.liveTrackingPaused) {
-      next.resumeStreak += 1;
-    } else if (hasAdvanceEvidence && nextIndexCandidate > currentProgress) {
-      next.advanceStreak += 1;
-    } else {
-      next.advanceStreak = 0;
-    }
-  }
-
-  let sentPauseNotification = false;
-  if (!next.liveTrackingPaused && next.conflictStreak >= CONFLICT_STREAK_TO_PAUSE) {
-    next.liveTrackingPaused = true;
-    next.resumeStreak = 0;
-    next.advanceStreak = 0;
-    sentPauseNotification = true;
-  }
-
-  let sentResumeNotification = false;
-  if (next.liveTrackingPaused && !hasConflict && next.resumeStreak >= RESUME_STREAK_TO_RESUME) {
-    next.liveTrackingPaused = false;
-    next.conflictStreak = 0;
-    next.resumeStreak = 0;
-    next.advanceStreak = 0;
-    sentResumeNotification = true;
-  }
-
-  if (sentPauseNotification) {
-    await sendRideNotification(
-      'Trip tracking paused',
-      'Live position unavailable. Trip tracking paused.',
-    );
-  }
-
-  if (sentResumeNotification) {
-    await sendRideNotification(
-      'Trip tracking resumed',
-      'Live position available. Trip tracking resumed.',
-    );
-  }
-
-  if (next.liveTrackingPaused) {
-    await writeSessionRaw(next);
-    return;
-  }
-
-  if (hasAdvanceEvidence && nextIndexCandidate > currentProgress && next.advanceStreak >= ADVANCE_STREAK_TO_PROGRESS) {
-    next.progressIndex = nextIndexCandidate;
-    next.advanceStreak = 0;
-  } else if (!(hasAdvanceEvidence && nextIndexCandidate > currentProgress)) {
-    next.advanceStreak = 0;
-  }
-
-  const remainingStops = Math.max(0, Number(next.destinationIndex) - Number(next.progressIndex || 0));
-
-  if (!next.sentLeadAlert && remainingStops === 1) {
-    await sendRideNotification(
-      'Track my Trip',
-      'Your destination is next stop. Prepare yourself.',
-    );
-    next.sentLeadAlert = true;
-  }
-
-  if (remainingStops === 0) {
-    next.status = 'completed';
-    next.completedAt = nowMs();
-    await writeSessionRaw(null);
+/**
+ * Ends the alert session: clears the persisted file and stops this engine's
+ * drivers. The shared background location task is stopped only when no
+ * live-activity session exists (it is also the card's background driver).
+ */
+async function endAlertSession() {
+  await writeSessionRaw(null);
+  await stopForegroundWatcher();
+  if (!(await hasLiveActivitySession())) {
     await stopLocationTask();
-    await stopForegroundWatcher();
-    return;
   }
+}
 
-  await writeSessionRaw(next);
+// ---------------------------------------------------------------------------
+// Engine tick — the only place progression happens, read from the feed.
+// ---------------------------------------------------------------------------
+
+export async function evaluateAlertsFromFeed() {
+  try {
+    const session = await loadAlertSession();
+    if (!session) return;
+
+    let state = null;
+    try {
+      state = computeTripState(session.tripId, session.fromStopId, session.toStopId || null);
+    } catch {
+      state = null;
+    }
+    if (!state) return;
+
+    let dirty = false;
+    const staleFeed = Boolean(state.staleFeed);
+    if (session.staleFeed !== staleFeed) {
+      session.staleFeed = staleFeed;
+      dirty = true;
+    }
+
+    const stopsRemaining =
+      state.ok && Number.isFinite(state.stopsRemaining) ? state.stopsRemaining : null;
+
+    if (state.arrived || stopsRemaining === 0) {
+      // Same event as the card ending: the alert session ends with the trip.
+      await endAlertSession();
+      return;
+    }
+
+    if (
+      stopsRemaining === session.leadStopsBefore &&
+      (session.alertState === 'on' || session.alertState === 'limited') &&
+      !session.sentLeadAlert
+    ) {
+      await sendRideNotification(
+        'Track my Trip',
+        'Your destination is next stop. Prepare yourself.',
+      );
+      session.sentLeadAlert = true;
+      dirty = true;
+      debugLog('Get-off alert fired', { tripId: session.tripId });
+    }
+
+    if (dirty) {
+      session.updatedAt = nowMs();
+      await writeSessionRaw(session);
+    }
+  } catch {}
+}
+
+/**
+ * One wake tick, shared by every driver: the 60s GtfsDataContext interval,
+ * the background location task, and the foreground watcher. Refreshes the
+ * card from the feed, then evaluates the alert engine from the same feed.
+ */
+async function onWakeTick() {
+  try {
+    await refreshLiveActivityFromFeed();
+  } catch {}
+  await evaluateAlertsFromFeed();
 }
 
 if (!TaskManager.isTaskDefined(LOCATION_TASK_NAME)) {
-  TaskManager.defineTask(LOCATION_TASK_NAME, async ({ data, error }) => {
+  TaskManager.defineTask(LOCATION_TASK_NAME, async ({ error }) => {
     if (error) return;
-    // Live Activity refresh driver: a location tick is just a wakeup signal.
-    // GPS coordinates are ignored for display (feed-only). Never throws.
-    try {
-      await refreshLiveActivityFromFeed();
-    } catch {}
-    const locations = data?.locations;
-    if (!Array.isArray(locations) || !locations.length) return;
-
-    const latest = locations[locations.length - 1];
-    const latitude = latest?.coords?.latitude;
-    const longitude = latest?.coords?.longitude;
-    if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return;
-
-    await processLocationUpdate(latitude, longitude);
+    // Wake driver only: the fix coordinates are ignored — progression is
+    // read from the feed, never from GPS. Never throws.
+    await onWakeTick();
   });
 }
 
-export async function getActiveRideSession() {
-  return normalizeActiveSession(await readSessionRaw());
-}
+// ---------------------------------------------------------------------------
+// Public API (fixed contracts — see TASK-SPLIT-REVISED-manual-only.md)
+// ---------------------------------------------------------------------------
 
-export async function stopActiveRide(reason = 'stopped') {
-  const current = await readSessionRaw();
-  await stopLocationTask();
-  await stopForegroundWatcher();
-
-  if (current) {
-    const ended = {
-      ...current,
-      status: String(reason || 'stopped'),
-      endedAt: nowMs(),
-    };
-    await writeSessionRaw(ended);
-  }
-
-  await writeSessionRaw(null);
-}
-
-// Helper: Find the latest stop index passed by the train using GTFS-RT Trip Updates
-function getProgressIndexFromTripUpdate(tripId, stops) {
-  // Use the stopDelaySeconds map as a proxy for which stops have been updated in GTFS-RT
-  const feed = gtfsRealtimeService;
-  if (!feed || !feed.stopDelaySeconds) return null;
-  let lastPassedIndex = null;
-  for (let i = 0; i < stops.length; i++) {
-    const stop = stops[i];
-    const key = `${tripId}:${stop.stop_id}`;
-    if (feed.stopDelaySeconds.has(key)) {
-      lastPassedIndex = i;
-    }
-  }
-  return lastPassedIndex;
-}
-
-export async function startRideFromSavedTrip(template, nextTrip, options = {}) {
-  const leadStopsBefore = Number(options.leadStopsBefore || DEFAULT_LEAD_STOPS);
-  const templateKey = String(template?.key || '').trim();
-  const fromStopId = String(template?.fromStopId || '').trim();
-  const toStopId = String(template?.toStopId || '').trim();
-  const tripId = String(nextTrip?.trip_id || '').trim();
-
-  if (!templateKey || !fromStopId || !tripId) {
-    throw new Error('Ride tracking needs a saved trip origin and an upcoming trip instance.');
-  }
-
-  const stops = buildStopsWithCoords(tripId, fromStopId, toStopId || null);
-  if (stops.length < 2) {
-    throw new Error('Could not build a stop sequence for this ride. Try again with another departure.');
-  }
-
-  const destination = stops[stops.length - 1];
-  const resolvedToStopId = toStopId || String(destination.stopId || '').trim();
-
-  await stopActiveRide('replaced');
-  const permissionState = await requestTrackingPermissions();
-  await ensureNotificationConfig();
-
-  let initialProgressIndex = 0;
-  let initialLatitude = null;
-  let initialLongitude = null;
-  let initialDistanceM = null;
-
-  // Only use GTFS-RT Trip Updates for progress
-  const stopsList = getTripStops(tripId, fromStopId, toStopId || null);
-  let tripUpdateProgress = null;
+/**
+ * Arms get-off alerts for a manually tracked trip. Replaces any active
+ * alert session. Never throws.
+ * → { armed, alertState, backgroundEnabled }
+ * `armed` is true when a session was persisted (including state 'off',
+ * whose session the strip's fix flow upgrades); false only when no session
+ * exists (invalid trip or a stop sequence that cannot be built).
+ */
+export async function startAlertsForTrip(args = {}) {
   try {
-    tripUpdateProgress = getProgressIndexFromTripUpdate(tripId, stopsList);
-  } catch {}
-  if (tripUpdateProgress !== null && tripUpdateProgress >= 0) {
-    initialProgressIndex = tripUpdateProgress;
-    debugLog('Startup progress from GTFS-RT', initialProgressIndex);
-  } else {
-    await sendRideNotification(
-      'Trip tracking unavailable',
-      'Live position unavailable. Trip tracking unable to continue.'
-    );
-    throw new Error('Live position unavailable. Trip tracking unable to continue.');
+    const tripId = String(args?.tripId || '').trim();
+    const fromStopId = String(args?.fromStopId || '').trim();
+    const toStopId = String(args?.toStopId || '').trim();
+    if (!tripId || !fromStopId) {
+      return { armed: false, alertState: 'off', backgroundEnabled: false };
+    }
+
+    // Validate the stop sequence against the single source before touching
+    // any existing session: a trip that cannot produce a sequence is a data
+    // failure, not a permission state — no session is persisted.
+    let state = null;
+    try {
+      state = computeTripState(tripId, fromStopId, toStopId || null);
+    } catch {
+      state = null;
+    }
+    const stopsCount = state && Array.isArray(state.stops) ? state.stops.length : 0;
+    if (!state || !state.ok || stopsCount < 2) {
+      return { armed: false, alertState: 'off', backgroundEnabled: false };
+    }
+
+    const existing = await readSessionRaw();
+    if (existing) {
+      await endAlertSession();
+    }
+
+    await ensureNotificationConfig();
+    const perms = await resolveAlertPermissions();
+    const { alertState, backgroundEnabled } = alertStateForPermissions(perms);
+
+    const session = {
+      engineVersion: ENGINE_VERSION,
+      status: 'active',
+      tripId,
+      fromStopId,
+      toStopId,
+      lineName: String(args?.lineName || 'GO'),
+      destinationName: String(args?.destinationName || state.destinationName || ''),
+      departureLabel: args?.departureLabel ?? null,
+      leadStopsBefore: DEFAULT_LEAD_STOPS,
+      alertState,
+      backgroundEnabled,
+      staleFeed: Boolean(state.staleFeed),
+      sentLeadAlert: false,
+      startedAt: nowMs(),
+      updatedAt: nowMs(),
+    };
+    await writeSessionRaw(session);
+    await startDriversForState(alertState);
+
+    debugLog('Alerts armed', { tripId, alertState, backgroundEnabled });
+    return { armed: true, alertState, backgroundEnabled };
+  } catch {
+    return { armed: false, alertState: 'off', backgroundEnabled: false };
   }
-
-  const session = {
-    id: `${templateKey}:${tripId}:${nowMs()}`,
-    status: 'active',
-    templateKey,
-    tripId,
-    fromStopId,
-    toStopId: resolvedToStopId,
-    fromStopName: String(template?.fromStopName || stops[0]?.stopName || ''),
-    destinationStopId: String(destination.stopId),
-    destinationStopName: String(template?.toStopName || destination.stopName || 'your stop'),
-    lineName: String(nextTrip?.lineName || template?.lineName || 'GO'),
-    leadStopsBefore: Number.isFinite(leadStopsBefore) ? Math.max(1, Math.floor(leadStopsBefore)) : DEFAULT_LEAD_STOPS,
-    progressIndex: initialProgressIndex,
-    destinationIndex: Number(destination.index),
-    sentLeadAlert: false,
-    liveTrackingPaused: false,
-    conflictStreak: 0,
-    resumeStreak: 0,
-    advanceStreak: 0,
-    backgroundEnabled: Boolean(permissionState?.backgroundEnabled),
-    stops,
-    lastKnownLatitude: initialLatitude,
-    lastKnownLongitude: initialLongitude,
-    lastKnownDistanceM: initialDistanceM,
-    startedAt: nowMs(),
-    updatedAt: nowMs(),
-  };
-
-  debugLog('Session at startup', session);
-
-  await writeSessionRaw(session);
-  await startLocationTask(Boolean(permissionState?.backgroundEnabled));
-  return session;
 }
 
-export async function resumeRideTracking() {
-  const active = await getActiveRideSession();
-  if (!active) {
-    await stopLocationTask();
-    await stopForegroundWatcher();
+/** Ends the alert session (if any) and its drivers. Never throws. */
+export async function stopAlerts(reason = 'stopped') {
+  void reason;
+  try {
+    await endAlertSession();
+  } catch {}
+}
+
+/**
+ * The status strip's only data source: null when no alert session exists,
+ * otherwise the persisted session's display state. Never throws.
+ */
+export async function getRideAlertStatus() {
+  try {
+    const session = await loadAlertSession();
+    if (!session) return null;
+    return {
+      tripId: session.tripId,
+      alertState: session.alertState,
+      backgroundEnabled: session.backgroundEnabled,
+      staleFeed: session.staleFeed,
+      destinationName: session.destinationName,
+      departureLabel: session.departureLabel,
+    };
+  } catch {
     return null;
   }
+}
 
-  await ensureNotificationConfig();
-  await startLocationTask();
-  return active;
+/**
+ * Re-runs the permission ladder for the persisted session (the strip's fix
+ * flow, and the Directive F return path: a background grant made in system
+ * Settings is picked up here with no prompt for what is already granted).
+ * Starts drivers if permissions now allow. Never throws.
+ */
+export async function retryAlertPermissions() {
+  try {
+    const session = await loadAlertSession();
+    if (!session) return { alertState: 'off' };
+
+    const perms = await resolveAlertPermissions();
+    const { alertState, backgroundEnabled } = alertStateForPermissions(perms);
+
+    session.alertState = alertState;
+    session.backgroundEnabled = backgroundEnabled;
+    session.updatedAt = nowMs();
+    await writeSessionRaw(session);
+
+    if (alertState === 'off') {
+      await stopForegroundWatcher();
+      if (!(await hasLiveActivitySession())) {
+        await stopLocationTask();
+      }
+    } else {
+      await startDriversForState(alertState);
+    }
+    return { alertState };
+  } catch {
+    return { alertState: 'off' };
+  }
+}
+
+/**
+ * Launch resume (imported by GtfsDataContext). Restores the persisted
+ * session's alert state and restarts its drivers honoring the STORED
+ * backgroundEnabled (Task D2 — the old build ignored it). Legacy GPS-engine
+ * sessions (no engineVersion: 2) are ended silently. Never throws; returns
+ * the normalized session, or null when there is nothing to resume.
+ */
+export async function resumeRideTracking() {
+  try {
+    const raw = await readSessionRaw();
+    if (raw && raw.engineVersion !== ENGINE_VERSION) {
+      await endAlertSession();
+      return null;
+    }
+
+    const session = await loadAlertSession();
+    if (!session) {
+      await stopForegroundWatcher();
+      if (!(await hasLiveActivitySession())) {
+        await stopLocationTask();
+      }
+      return null;
+    }
+
+    await ensureNotificationConfig();
+    // Task D2: drivers restart from the STORED backgroundEnabled, not a
+    // fresh default. ('off' sessions deliberately have no drivers — the
+    // permission matrix — so there is nothing to restart for them.)
+    if (session.alertState !== 'off') {
+      try {
+        await startLocationTask(session.backgroundEnabled);
+      } catch {}
+    }
+    return session;
+  } catch {
+    return null;
+  }
 }

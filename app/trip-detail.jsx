@@ -11,6 +11,8 @@ import {
   Alert,
   Animated,
   Easing,
+  Linking,
+  Platform,
   ScrollView,
   RefreshControl,
   StyleSheet,
@@ -20,7 +22,7 @@ import {
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { useLocalSearchParams, useRouter } from 'expo-router';
+import { useFocusEffect, useLocalSearchParams, useRouter } from 'expo-router';
 import { MaterialIcons } from '@expo/vector-icons';
 import TripResultCard from '../components/TripResultCard';
 import { DateTime } from 'luxon';
@@ -36,6 +38,12 @@ import {
   saveTrip,
 } from '../services/savedTripsService';
 import { startForTrip, stopTracking, getActiveLiveSession } from '../services/liveActivityService';
+import {
+  startAlertsForTrip,
+  stopAlerts,
+  getRideAlertStatus,
+  retryAlertPermissions,
+} from '../services/rideTrackingService';
 
 const GO_GREEN = '#00853F';
 const STATUS_DELAYED = '#D22F27';
@@ -294,6 +302,11 @@ export default function TripDetailScreen() {
   const [saved, setSaved] = useState(false);
   const [tracking, setTracking] = useState(false);
   const [trackBusy, setTrackBusy] = useState(false);
+  // Get-off alert status for THIS trip (from getRideAlertStatus — the strip's
+  // only data source); null when this trip has no alert session.
+  const [alertStatus, setAlertStatus] = useState(null);
+  // A tracking session (card or alert) belonging to a DIFFERENT trip (UI-5).
+  const [otherTracking, setOtherTracking] = useState(null);
 
   const departureIsoForPlatform =
     scheduledDateTime || (Array.isArray(stops) && stops[0]?.arrival_date_time ? String(stops[0].arrival_date_time) : null);
@@ -408,22 +421,83 @@ export default function TripDetailScreen() {
     };
   }, [tripId, fromStopId, toStopId, departureTime, lineName, resolvedPattern, servicePattern, isBus]);
 
-  useEffect(() => {
-    let mounted = true;
-    (async () => {
-      try {
-        const session = await getActiveLiveSession();
-        if (mounted) {
-          setTracking(!!(session && String(session.tripId) === String(tripId)));
-        }
-      } catch {
-        if (mounted) setTracking(false);
-      }
-    })();
-    return () => {
-      mounted = false;
-    };
+  // UI-7: the single session-derivation. Derives BOTH halves — button state
+  // from the live-activity session, strip state from the ride-alert status —
+  // plus the different-trip session behind the UI-5 line. On Android there is
+  // no card, so the alert session alone drives the button there.
+  const refreshTrackingState = useCallback(async () => {
+    let live = null;
+    let ride = null;
+    try {
+      live = await getActiveLiveSession();
+    } catch {
+      live = null;
+    }
+    try {
+      ride = await getRideAlertStatus();
+    } catch {
+      ride = null;
+    }
+
+    const isThisTrip = (s) => !!(s && tripId && String(s.tripId) === String(tripId));
+    setTracking(isThisTrip(live) || isThisTrip(ride));
+    setAlertStatus(isThisTrip(ride) ? ride : null);
+
+    const other = [live, ride].find((s) => s && !isThisTrip(s)) || null;
+    setOtherTracking(
+      other
+        ? {
+            departureLabel: other.departureLabel || '',
+            destinationName: other.destinationName || '',
+          }
+        : null,
+    );
   }, [tripId]);
+
+  // UI-7: derive on mount / trip change.
+  useEffect(() => {
+    refreshTrackingState();
+  }, [refreshTrackingState]);
+
+  // UI-7: re-derive on every realtime tick (30s interval above).
+  useEffect(() => {
+    if (rtTick === 0) return;
+    refreshTrackingState();
+  }, [rtTick, refreshTrackingState]);
+
+  // UI-7: re-derive on screen focus. On Android this is also the Directive F
+  // return path: if the user granted "Always" location in system Settings
+  // while a session sits in `limited`, pick the grant up via
+  // retryAlertPermissions (starts the background drivers) before re-deriving.
+  useFocusEffect(
+    useCallback(() => {
+      let cancelled = false;
+      (async () => {
+        if (Platform.OS === 'android' && tripId) {
+          try {
+            const status = await getRideAlertStatus();
+            if (
+              !cancelled &&
+              status &&
+              String(status.tripId) === String(tripId) &&
+              status.alertState === 'limited' &&
+              !status.backgroundEnabled
+            ) {
+              await retryAlertPermissions();
+            }
+          } catch {
+            // Best-effort pickup; the re-derive below still runs.
+          }
+        }
+        if (!cancelled) {
+          refreshTrackingState();
+        }
+      })();
+      return () => {
+        cancelled = true;
+      };
+    }, [tripId, refreshTrackingState]),
+  );
 
   useEffect(() => {
     let mounted = true;
@@ -525,33 +599,151 @@ export default function TripDetailScreen() {
     [upcomingBlink],
   );
 
+  // Directive E (iOS): each startForTrip failure reason gets its own outcome.
+  // The iOS-16.2 message appears ONLY for the actual version case.
+  // 'unsupported-platform' shows nothing (unreachable on iOS; the normal
+  // alerts-only path on Android, where no card message ever appears).
+  const showCardFailure = useCallback((reason) => {
+    if (reason === 'ios-version') {
+      Alert.alert('Live trip tracking needs iOS 16.2 or later.');
+    } else if (reason === 'already-arrived' || reason === 'trip-ended') {
+      Alert.alert('That train has already left.');
+    } else if (reason !== 'unsupported-platform') {
+      Alert.alert("Couldn't start tracking. Please try again.");
+    }
+  }, []);
+
   const handleTrackTrip = useCallback(async () => {
     if (!tripId || trackBusy) return;
 
     if (tracking) {
+      // Orchestration step 4: one stop tap ends BOTH the card and the alert
+      // session, then state is re-derived rather than assumed.
+      setTrackBusy(true);
       try {
         await stopTracking();
       } catch {
-        // stopTracking is best-effort; clear local state regardless
+        // stopTracking is best-effort; stopAlerts still runs below.
       }
-      setTracking(false);
+      try {
+        await stopAlerts('stopped');
+      } catch {
+        // stopAlerts never throws by contract; stay defensive anyway.
+      }
+      await refreshTrackingState();
+      setTrackBusy(false);
       return;
     }
 
     setTrackBusy(true);
     try {
-      const result = await startForTrip({ tripId, fromStopId, toStopId: toStopId || '' });
-      if (result && result.started === false) {
-        Alert.alert('Live trip tracking needs iOS 16.2 or later.');
-      } else {
-        setTracking(true);
+      // Orchestration step 1: the card starts first — it is never delayed by
+      // any permission prompt (alert arming happens after, and its outcomes
+      // land in the strip as states, never as modals).
+      let result = null;
+      try {
+        result = await startForTrip({
+          tripId,
+          fromStopId,
+          toStopId: toStopId || '',
+          lineName: lineName || '',
+          destinationName: summary.toName,
+          departureLabel: summary.departure,
+          departureTime: departureTime ? String(departureTime) : undefined,
+          scheduledDateTime: scheduledDateTime || undefined,
+        });
+      } catch {
+        result = { started: false, reason: 'error' };
       }
-    } catch {
-      // startForTrip surfaces hard failures via { started: false }; stay untracked
+
+      const cardStarted = !!(result && result.started !== false);
+      if (!cardStarted && Platform.OS !== 'android') {
+        // Orchestration step 2 (iOS): Directive E outcome; do NOT arm alerts.
+        showCardFailure(result.reason);
+      } else {
+        // Orchestration step 3: iOS card started, or Android (unsupported-
+        // platform — no message, ever) → arm the get-off alerts. Show the
+        // transient 'setting-up' state while arming resolves.
+        setAlertStatus({
+          tripId,
+          alertState: 'setting-up',
+          backgroundEnabled: false,
+          staleFeed: false,
+          destinationName: summary.toName,
+          departureLabel: summary.departure,
+        });
+        try {
+          await startAlertsForTrip({
+            tripId,
+            fromStopId,
+            toStopId: toStopId || '',
+            lineName: lineName || '',
+            destinationName: summary.toName,
+            departureLabel: summary.departure,
+          });
+        } catch {
+          // startAlertsForTrip never throws by contract; the re-derive below
+          // renders whatever session state actually persisted.
+        }
+      }
+      await refreshTrackingState();
     } finally {
       setTrackBusy(false);
     }
-  }, [tripId, fromStopId, toStopId, tracking, trackBusy]);
+  }, [
+    tripId,
+    fromStopId,
+    toStopId,
+    lineName,
+    departureTime,
+    scheduledDateTime,
+    summary,
+    tracking,
+    trackBusy,
+    showCardFailure,
+    refreshTrackingState,
+  ]);
+
+  // Status-strip fix flow for the tappable variants (`limited` / `off`).
+  const handleAlertStripPress = useCallback(async () => {
+    if (!alertStatus || trackBusy) return;
+    const state = alertStatus.alertState;
+    if (state !== 'limited' && state !== 'off') return;
+
+    // Directive F (Android `limited`): Android 11+ offers no in-app popup for
+    // "Always" location — the tap opens the app's system Settings page; the
+    // grant is picked up on return (focus re-derive). Android ≤ 10 still
+    // allows the in-app request, which retryAlertPermissions runs.
+    if (
+      Platform.OS === 'android' &&
+      state === 'limited' &&
+      Number(Platform.Version) >= 30
+    ) {
+      try {
+        await Linking.openSettings();
+      } catch {
+        // Nothing sensible to fall back to; the ask stays on the strip.
+      }
+      return;
+    }
+
+    let nextState = null;
+    try {
+      const res = await retryAlertPermissions();
+      nextState = res?.alertState || null;
+    } catch {
+      nextState = null;
+    }
+    await refreshTrackingState();
+    // Still stuck after the in-app retry (permanently denied) → Settings.
+    if (nextState && nextState === state) {
+      try {
+        await Linking.openSettings();
+      } catch {
+        // Leave the strip as-is; the user can tap again.
+      }
+    }
+  }, [alertStatus, trackBusy, refreshTrackingState]);
 
   const handleSaveTrip = useCallback(async () => {
     if (!tripId || !fromStopId || isSaving) return;
@@ -725,6 +917,60 @@ export default function TripDetailScreen() {
     return formatLiveStatusLabel(liveStatus, liveDelayMinutes, summary.departure);
   }, [liveStatus, liveDelayMinutes, summary.departure]);
 
+  // Status strip content (Task U1 copy table). Null when this trip has no
+  // alert session — the strip renders only from getRideAlertStatus data.
+  const stripContent = useMemo(() => {
+    if (!alertStatus) return null;
+    const destination = alertStatus.destinationName || summary.toName;
+    let line = null;
+    let tappable = false;
+    switch (alertStatus.alertState) {
+      case 'setting-up':
+        line = '🔔 Get-off alert: setting up…';
+        break;
+      case 'on':
+        line = `🔔 Get-off alert on — one stop before ${destination}`;
+        break;
+      case 'limited':
+        // Android `limited` is the Directive F ask; iOS keeps the fix copy.
+        line =
+          Platform.OS === 'android'
+            ? '🔔 Alerts work only while the app is open — tap to turn on "Always" location'
+            : '🔔 Get-off alert on while the app is open — tap to fix';
+        tappable = true;
+        break;
+      case 'off':
+        line = '🔔 Get-off alert off — tap to turn on';
+        tappable = true;
+        break;
+      default:
+        line = null;
+    }
+    if (!line) return null;
+    return { line, tappable, staleFeed: !!alertStatus.staleFeed };
+  }, [alertStatus, summary.toName]);
+
+  // UI-5: a session for a different trip is disclosed, not silently replaced.
+  const otherTrackingLine = useMemo(() => {
+    if (!otherTracking) return null;
+    const { departureLabel, destinationName } = otherTracking;
+    if (!departureLabel && !destinationName) return null;
+    if (!departureLabel) return `You're tracking a trip to ${destinationName}.`;
+    if (!destinationName) return `You're tracking the ${departureLabel} trip.`;
+    return `You're tracking the ${departureLabel} to ${destinationName}.`;
+  }, [otherTracking]);
+
+  const stripBody = stripContent ? (
+    <>
+      <Text style={styles.alertStripText}>{stripContent.line}</Text>
+      {stripContent.staleFeed ? (
+        <Text style={styles.alertStripSubText}>
+          Live updates paused — get-off alert may be late
+        </Text>
+      ) : null}
+    </>
+  ) : null;
+
   return (
     <View style={[styles.screen, { paddingTop: insets.top, paddingBottom: insets.bottom }]}> 
       <StatusBar style="dark" />
@@ -769,6 +1015,26 @@ export default function TripDetailScreen() {
           </TouchableOpacity>
         </View>
       </View>
+
+      {stripContent ? (
+        stripContent.tappable ? (
+          <TouchableOpacity
+            style={styles.alertStrip}
+            onPress={handleAlertStripPress}
+            activeOpacity={0.8}
+          >
+            {stripBody}
+          </TouchableOpacity>
+        ) : (
+          <View style={styles.alertStrip}>{stripBody}</View>
+        )
+      ) : null}
+
+      {otherTrackingLine ? (
+        <View style={styles.otherTrackingBar}>
+          <Text style={styles.otherTrackingText}>{otherTrackingLine}</Text>
+        </View>
+      ) : null}
 
       <View style={styles.liveStatusBar}>
         <Text style={styles.liveStatusText}>{liveStatusLabel}</Text>
@@ -830,6 +1096,24 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     color: '#111827',
   },
+  alertStrip: {
+    marginHorizontal: 12,
+    marginBottom: 10,
+    backgroundColor: '#ffffff',
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    minHeight: 44,
+    justifyContent: 'center',
+  },
+  alertStripText: { fontSize: 14, fontWeight: '600', color: '#111827' },
+  alertStripSubText: { marginTop: 2, fontSize: 13, color: '#6b7280' },
+  otherTrackingBar: {
+    marginHorizontal: 12,
+    marginBottom: 10,
+    paddingHorizontal: 12,
+  },
+  otherTrackingText: { fontSize: 13, color: '#374151', fontWeight: '600' },
   backBtn: { alignSelf: 'flex-start', flexDirection: 'row', alignItems: 'center', paddingHorizontal: 12, paddingVertical: 8, gap: 4, borderRadius: 999, backgroundColor: '#fff', elevation: 3, shadowColor: '#000', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.12, shadowRadius: 4 },
   backText: { fontSize: 15, color: GO_GREEN, fontWeight: '600' },
   saveBtn: { minWidth: 82, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 5, paddingHorizontal: 12, paddingVertical: 8, borderRadius: 999, backgroundColor: '#fff', elevation: 3, shadowColor: '#000', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.12, shadowRadius: 4 },

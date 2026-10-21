@@ -9,6 +9,8 @@
 
 import React, { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import * as FileSystem from 'expo-file-system/legacy';
+import * as Location from 'expo-location';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 
 import {
   invalidateActiveGtfsLoad,
@@ -23,7 +25,6 @@ import {
 } from '../services/gtfsRealtimeService';
 import { resumeRideTracking } from '../services/rideTrackingService';
 import { reconcileOnLaunch, refreshFromFeed } from '../services/liveActivityService';
-import { initAutoStart } from '../services/tripAutoStartService';
 import { reportStartupTiming } from '../services/startupTelemetry';
 
 /**
@@ -36,6 +37,30 @@ const GTFS_DEBUG_TIMEOUT_MS = 2 * 60 * 1000;
 const GTFS_STALL_TIMEOUT_MS = 75 * 1000;
 const GTFS_STALL_CHECK_INTERVAL_MS = 10 * 1000;
 const GTFS_DEBUG_LOG_FILE = `${FileSystem.documentDirectory}gtfs-startup-debug-last.txt`;
+
+const AUTOSTART_GEOFENCE_CLEANUP_KEY = 'autostart-geofence-cleanup-v1';
+// Exact task name the removed auto-start service registered its geofences
+// under (was its GEOFENCE_TASK constant).
+const LEGACY_GEOFENCE_TASK = 'transitscanner-geofence-task';
+
+/**
+ * One-time cleanup for the scrapped auto-start feature: preview builds
+ * registered station geofences on some devices, and those native regions
+ * outlive the JS that defined their task. Unregister them once, at startup.
+ * Best-effort by design — the flag is set before the native call so this
+ * stays a true one-shot even when stopGeofencingAsync rejects (e.g. nothing
+ * was ever registered on this device), and nothing here may throw.
+ */
+async function cleanupLegacyAutoStartGeofences() {
+  try {
+    const done = await AsyncStorage.getItem(AUTOSTART_GEOFENCE_CLEANUP_KEY);
+    if (done) return;
+    await AsyncStorage.setItem(AUTOSTART_GEOFENCE_CLEANUP_KEY, '1');
+    await Location.stopGeofencingAsync(LEGACY_GEOFENCE_TASK);
+  } catch {
+    // Never let a legacy cleanup break or block startup.
+  }
+}
 
 const GtfsDataContext = createContext({
   ready: false,
@@ -288,9 +313,9 @@ export function GtfsDataProvider({ children }) {
           // run, then keep the active one fresh on a 60s tick (the service
           // itself throttles native updates to max once per 60s).
           reconcileOnLaunch().catch(() => {});
-          // Smart auto-start: register station geofences for saved trips.
-          // No "Always" permission -> skips silently; manual tracking unaffected.
-          initAutoStart().catch(() => {});
+          // Auto-start was removed in v1.2: one-time cleanup unregisters
+          // any station geofences it left registered on this device.
+          cleanupLegacyAutoStartGeofences().catch(() => {});
           if (liveRefreshTimer) clearInterval(liveRefreshTimer);
           liveRefreshTimer = setInterval(() => {
             refreshFromFeed().catch(() => {});

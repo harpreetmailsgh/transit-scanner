@@ -368,6 +368,20 @@ async function endAlertSession() {
   }
 }
 
+/**
+ * Self-heals the shared background location task. endAlertSession stops
+ * the task only when the alert session ends last; if the card session
+ * outlives it and then ends (liveActivityService never stops the task),
+ * the task keeps waking the app with both engines idle. Called from the
+ * no-session tick path: with neither session present, stop the task.
+ * stopLocationTask is idempotent and never throws — if the stop fails,
+ * hasStarted still reads true and the next tick retries.
+ */
+async function stopLocationTaskIfOrphaned() {
+  if (await hasLiveActivitySession()) return;
+  await stopLocationTask();
+}
+
 // ---------------------------------------------------------------------------
 // Engine tick — the only place progression happens, read from the feed.
 // ---------------------------------------------------------------------------
@@ -375,7 +389,10 @@ async function endAlertSession() {
 export async function evaluateAlertsFromFeed() {
   try {
     const session = await loadAlertSession();
-    if (!session) return;
+    if (!session) {
+      await stopLocationTaskIfOrphaned();
+      return;
+    }
 
     let state = null;
     try {

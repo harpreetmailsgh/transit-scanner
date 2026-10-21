@@ -106,6 +106,25 @@ function isiOSVersionSupported() {
   }
 }
 
+/**
+ * Builds the full deep link to a trip's detail screen. Single construction
+ * point for that URL: the notification flow uses the full URL as-is; the
+ * Live Activity card passes its path form (see startForTrip) because the
+ * widget template prepends the app scheme itself. The optional
+ * departureTime / scheduledDateTime params append only when provided.
+ */
+export function buildTripDetailUrl({ tripId, fromStopId, toStopId, lineName, departureTime, scheduledDateTime }) {
+  const parts = [
+    `tripId=${encodeURIComponent(tripId)}`,
+    `fromStopId=${encodeURIComponent(fromStopId)}`,
+    `toStopId=${encodeURIComponent(toStopId || '')}`,
+    `lineName=${encodeURIComponent(lineName || '')}`,
+  ];
+  if (departureTime) parts.push(`departureTime=${encodeURIComponent(departureTime)}`);
+  if (scheduledDateTime) parts.push(`scheduledDateTime=${encodeURIComponent(scheduledDateTime)}`);
+  return `transitscanner:///trip-detail?${parts.join('&')}`;
+}
+
 // ---------------------------------------------------------------------------
 // Trip state computation — pure (no side effects), testable via deps.
 // ---------------------------------------------------------------------------
@@ -240,12 +259,13 @@ function mapContent(state, lineName, destinationName) {
   };
 }
 
-function activityConfig() {
+function activityConfig(deepLinkUrl) {
   return {
     backgroundColor: GO_GREEN,
     titleColor: WHITE,
     subtitleColor: WHITE,
     timerType: 'digital',
+    deepLinkUrl,
   };
 }
 
@@ -280,8 +300,20 @@ async function endCurrentActivity(reason) {
  * Starts a Live Activity for a trip. Never throws.
  * Optional overrides (lineName, destinationName) let callers pass what the
  * UI already knows; otherwise derived from static GTFS data.
+ * departureLabel (the departure-time label the UI displays) is stored on
+ * the session; departureTime / scheduledDateTime only enrich the card's
+ * tap deep link.
  */
-export async function startForTrip({ tripId, fromStopId, toStopId, lineName, destinationName } = {}) {
+export async function startForTrip({
+  tripId,
+  fromStopId,
+  toStopId,
+  lineName,
+  destinationName,
+  departureLabel,
+  departureTime,
+  scheduledDateTime,
+} = {}) {
   try {
     if (!tripId || !fromStopId) return { started: false, reason: 'missing-trip' };
     if (Platform.OS !== 'ios') return { started: false, reason: 'unsupported-platform' };
@@ -304,15 +336,27 @@ export async function startForTrip({ tripId, fromStopId, toStopId, lineName, des
       toStopId: toStopId ? String(toStopId) : null,
       lineName: line,
       destinationName: dest,
+      departureLabel: departureLabel || null,
       activityId: null,
       startedAtMs: Date.now(),
     };
     await writeSession(session);
 
     const content = mapContent(state, line, dest);
+    // The widget template prepends the app scheme to deepLinkUrl, so the
+    // card carries the path form only; scheme + path stays byte-identical
+    // to buildTripDetailUrl's full form.
+    const deepLinkUrl = buildTripDetailUrl({
+      tripId,
+      fromStopId,
+      toStopId,
+      lineName,
+      departureTime,
+      scheduledDateTime,
+    }).replace(/^transitscanner:\/\//, '');
     let activityId = null;
     try {
-      activityId = LiveActivity.startActivity(content, activityConfig());
+      activityId = LiveActivity.startActivity(content, activityConfig(deepLinkUrl));
     } catch {
       activityId = null;
     }
@@ -458,6 +502,7 @@ export async function reconcileOnLaunch() {
       toStopId: session.toStopId,
       lineName: session.lineName,
       destinationName: session.destinationName,
+      departureLabel: session.departureLabel || null,
     });
     return {
       reconciled: true,

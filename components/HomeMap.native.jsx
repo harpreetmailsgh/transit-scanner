@@ -3,7 +3,7 @@
  * so the web bundle never imports react-native-maps.
  */
 
-import { Platform, StyleSheet, Text, View } from 'react-native';
+import { StyleSheet } from 'react-native';
 import MapView, { Marker, Polyline, PROVIDER_DEFAULT } from 'react-native-maps';
 
 const RAIL_ROUTE_TYPE = 2;
@@ -40,14 +40,6 @@ export default function HomeMap({
   vehicleMarkerRefs,
   onStopPress,
 }) {
-  if (Platform.OS === 'android') {
-    return (
-      <View style={styles.androidPlaceholder}>
-        <Text style={styles.androidPlaceholderText}>Map coming to Android soon</Text>
-      </View>
-    );
-  }
-
   const trainLines = trainShapePolylines || [];
   const busLines = busShapePolylines || [];
   const filteredStopMarkers = (stopMarkers || []).filter((s) => {
@@ -147,19 +139,3 @@ export default function HomeMap({
     </MapView>
   );
 }
-
-const styles = StyleSheet.create({
-  androidPlaceholder: {
-    ...StyleSheet.absoluteFillObject,
-    backgroundColor: '#00853F',
-    justifyContent: 'center',
-    alignItems: 'center',
-    padding: 24,
-  },
-  androidPlaceholderText: {
-    color: '#fff',
-    fontSize: 18,
-    fontWeight: '600',
-    textAlign: 'center',
-  },
-});

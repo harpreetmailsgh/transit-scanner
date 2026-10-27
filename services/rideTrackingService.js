@@ -40,6 +40,15 @@ import {
 const RIDE_SESSION_FILE = `${FileSystem.documentDirectory}active-ride-v1.json`;
 const LOCATION_TASK_NAME = 'transitscanner-active-ride-location-task';
 const ENGINE_VERSION = 2;
+// Fixed notification identifier so each per-stop alert REPLACES the
+// previous one in the shade instead of stacking (Harpreet's 2026-10-26
+// call). Verified against the installed expo-notifications 0.32.17:
+// JS passes `identifier` through (omitted => fresh UUID, which is why the
+// old code stacked); Android posts with notify(tag=identifier, id=0), so
+// the same tag+id replaces; iOS builds UNNotificationRequest with the
+// identifier, and UNUserNotificationCenter replaces a delivered
+// notification bearing the same identifier. One entry ever visible.
+const RIDE_ALERT_NOTIFICATION_ID = 'ride-alert';
 const DEFAULT_LEAD_STOPS = 1;
 const LOCATION_TIME_INTERVAL_MS = 15000;
 const LOCATION_DISTANCE_INTERVAL_M = 60;
@@ -109,7 +118,11 @@ async function loadAlertSession() {
       : 'off',
     backgroundEnabled: Boolean(raw.backgroundEnabled ?? false),
     staleFeed: Boolean(raw.staleFeed ?? false),
-    sentLeadAlert: Boolean(raw.sentLeadAlert ?? false),
+    // Per-stop dedup: the next stop last notified for. Old builds wrote
+    // `sentLeadAlert` instead — that field is ignored on load, so a
+    // session written by the current build fires per-stop from its current
+    // next stop with no migration.
+    lastNotifiedStopId: raw.lastNotifiedStopId ? String(raw.lastNotifiedStopId) : null,
     startedAt: Number(raw.startedAt) || 0,
     updatedAt: Number(raw.updatedAt) || 0,
   };
@@ -143,6 +156,9 @@ async function ensureNotificationConfig() {
 async function sendRideNotification(title, body) {
   await ensureNotificationConfig();
   await Notifications.scheduleNotificationAsync({
+    // Fixed identifier: each new alert replaces the previous one in the
+    // shade (see RIDE_ALERT_NOTIFICATION_ID) — never stacking.
+    identifier: RIDE_ALERT_NOTIFICATION_ID,
     content: {
       title,
       body,
@@ -418,18 +434,26 @@ export async function evaluateAlertsFromFeed() {
       return;
     }
 
+    // Per-stop alerts (ADDENDUM-per-stop-alerts.md §2–§8): fire once per
+    // next-stop change, naming the upcoming stop. The final fire, at 1 stop
+    // remaining, names the destination itself. Repeated ticks at the same
+    // next stop never re-fire; missing next-stop data fires nothing, never
+    // a blank-name notification. The old exactly-once-at-1-stop rule and
+    // its sentLeadAlert gate are gone; leadStopsBefore is no longer
+    // consulted for firing.
+    const nextStopId = state.ok && state.nextStopId ? String(state.nextStopId) : null;
+    const nextStopName =
+      state.ok && state.nextStopName ? String(state.nextStopName).trim() : '';
     if (
-      stopsRemaining === session.leadStopsBefore &&
+      nextStopId &&
+      nextStopName &&
       (session.alertState === 'on' || session.alertState === 'limited') &&
-      !session.sentLeadAlert
+      session.lastNotifiedStopId !== nextStopId
     ) {
-      await sendRideNotification(
-        'Track my Trip',
-        'Your destination is next stop. Prepare yourself.',
-      );
-      session.sentLeadAlert = true;
+      await sendRideNotification('Track my Trip', `Up next ${nextStopName}`);
+      session.lastNotifiedStopId = nextStopId;
       dirty = true;
-      debugLog('Get-off alert fired', { tripId: session.tripId });
+      debugLog('Per-stop alert fired', { tripId: session.tripId, nextStopId });
     }
 
     if (dirty) {
@@ -517,7 +541,7 @@ export async function startAlertsForTrip(args = {}) {
       alertState,
       backgroundEnabled,
       staleFeed: Boolean(state.staleFeed),
-      sentLeadAlert: false,
+      lastNotifiedStopId: null,
       startedAt: nowMs(),
       updatedAt: nowMs(),
     };

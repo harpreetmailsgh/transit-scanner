@@ -929,7 +929,7 @@ export default function TripDetailScreen() {
         line = '🔔 Get-off alert: setting up…';
         break;
       case 'on':
-        line = `🔔 Get-off alert on — one stop before ${destination}`;
+        line = '🔔 Get-off alert on — updates at every stop';
         break;
       case 'limited':
         // Android `limited` is the Directive F ask; iOS keeps the fix copy.

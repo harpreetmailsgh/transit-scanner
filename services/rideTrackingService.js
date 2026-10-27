@@ -429,14 +429,42 @@ export async function evaluateAlertsFromFeed() {
       state.ok && Number.isFinite(state.stopsRemaining) ? state.stopsRemaining : null;
 
     if (state.arrived || stopsRemaining === 0) {
+      // F-DEST fix: the tick where the destination becomes the next stop is
+      // exactly the stopsRemaining === 0 tick, which used to end the session
+      // before the fire block below could run — so `Up next <destination>`
+      // could never fire. Fire it once here under the same rule as the
+      // per-stop block (name present, alert on/limited, ID differs from the
+      // last notified stop), then end the session silently as before.
+      // When arrived is true there is no next stop, so the name check alone
+      // prevents a fire; missing data never fires, never a blank name.
+      // No persist of lastNotifiedStopId is needed: endAlertSession deletes
+      // the session immediately below, and later ticks find no session and
+      // cannot refire.
+      const finalStopId = state.ok && state.nextStopId ? String(state.nextStopId) : null;
+      const finalStopName =
+        state.ok && state.nextStopName ? String(state.nextStopName).trim() : '';
+      if (
+        stopsRemaining === 0 &&
+        !state.arrived &&
+        finalStopId &&
+        finalStopName &&
+        (session.alertState === 'on' || session.alertState === 'limited') &&
+        session.lastNotifiedStopId !== finalStopId
+      ) {
+        await sendRideNotification('Track my Trip', `Up next ${finalStopName}`);
+        session.lastNotifiedStopId = finalStopId;
+        debugLog('Final-stop alert fired', { tripId: session.tripId, nextStopId: finalStopId });
+      }
       // Same event as the card ending: the alert session ends with the trip.
       await endAlertSession();
       return;
     }
 
     // Per-stop alerts (ADDENDUM-per-stop-alerts.md §2–§8): fire once per
-    // next-stop change, naming the upcoming stop. The final fire, at 1 stop
-    // remaining, names the destination itself. Repeated ticks at the same
+    // next-stop change, naming the upcoming stop. The final fire, on the
+    // stopsRemaining === 0 tick, names the destination itself (see the
+    // F-DEST block above — that tick ends the session, so the fire must
+    // happen before the end, not in this block). Repeated ticks at the same
     // next stop never re-fire; missing next-stop data fires nothing, never
     // a blank-name notification. The old exactly-once-at-1-stop rule and
     // its sentLeadAlert gate are gone; leadStopsBefore is no longer

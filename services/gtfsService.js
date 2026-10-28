@@ -1588,12 +1588,22 @@ async function loadFromHostedSqlite(onProgress, options = {}) {
     emitProgress(onProgress, msg || 'Downloading schedules database...', Number.isFinite(pct) ? pct : undefined);
   };
 
+  // B0 week-gap fix: startup dates are computed before ensure so the
+  // bundle layer can download week DBs covering them. A fresh install
+  // otherwise ends startup with zero installed weeks, and the first day
+  // outside the month span loads zero trips.
+  const today = torontoTodayYmd();
+  const startupDates = [];
+  for (let i = 0; i < STARTUP_SCHEDULE_DAYS; i += 1) {
+    startupDates.push(addDaysYmd(today, i));
+  }
+
   // Local-first: use the on-device database immediately so a slow or failing
   // manifest fetch can't stall or fail startup. Version checks and downloads
   // happen in the background update flow after the app is ready.
   let ensured;
   if (options.forceDownload) {
-    ensured = await ensureHostedSqlite({ force: true, onProgress: ensureProgress });
+    ensured = await ensureHostedSqlite({ force: true, onProgress: ensureProgress, requestedDates: startupDates });
   } else {
     const local = await ensureLocalHostedSqlite().catch(() => ({
       ok: false,
@@ -1601,7 +1611,7 @@ async function loadFromHostedSqlite(onProgress, options = {}) {
     }));
     ensured = local?.ok
       ? local
-      : await ensureHostedSqlite({ force: false, onProgress: ensureProgress });
+      : await ensureHostedSqlite({ force: false, onProgress: ensureProgress, requestedDates: startupDates });
   }
 
   if (!ensured?.ok) {
@@ -1623,12 +1633,6 @@ async function loadFromHostedSqlite(onProgress, options = {}) {
   setStartupPhase('sqlite-load-startup-schedules', 'Loading startup schedules from SQLite');
   emitProgress(onProgress, 'Loading startup schedules...', 0.55);
 
-  const today = torontoTodayYmd();
-  const startupDates = [];
-  for (let i = 0; i < STARTUP_SCHEDULE_DAYS; i += 1) {
-    startupDates.push(addDaysYmd(today, i));
-  }
-
   const startupModes = { train: true, bus: true };
   const schedule = await loadHostedSchedulesForDates(
     startupDates,
@@ -1641,6 +1645,17 @@ async function loadFromHostedSqlite(onProgress, options = {}) {
       emitProgress(onProgress, msg || 'Loading schedules...', Number.isFinite(pct) ? pct : undefined);
     },
   );
+
+  // B0 companion: zero trips for the requested startup dates is a
+  // schedules-unavailable state, not a load success. Throwing routes to
+  // the context's visible load-error screen instead of a normal-looking
+  // trip-detail with 0 stops.
+  if (schedule.trips.length === 0) {
+    logGtfs('startup-schedules-empty', { dates: startupDates });
+    throw new Error(
+      `Hosted schedules unavailable for ${startupDates.join(', ')} (zero trips loaded).`,
+    );
+  }
 
   await appendScheduleData(schedule.trips, schedule.stopTimes);
   await finalizeStopTimeTripIndexes();

@@ -703,41 +703,59 @@ async function ensureHostedBundleV2(manifest, options = {}) {
   const checkDue = force || isCheckDue(meta);
   let weeksChanged = false;
 
-  if (checkDue && !versionChanged) {
-    for (const week of manifest.weeks || []) {
-      const weekId = String(week.id || week.startDate || '');
-      if (!weekId || installedWeekIds.has(weekId)) continue;
-      const dest = weekDbUri(week.startDate);
-      onProgress?.({ message: `Downloading week ${week.startDate}...`, percent: 0.55 });
-      await downloadBundleAsset(week, dest, onProgress, `week ${week.startDate}`);
-      const weekValidation = await validateDbTables(weekDbName(week.startDate), ['trips', 'stop_times']).catch(
-        (error) => ({ ok: false, reason: error?.message }),
-      );
-      if (!weekValidation.ok) {
-        await FileSystem.deleteAsync(dest, { idempotent: true }).catch(() => {});
-        logHostedSqlite('bundle:v2:week-validation-failed', {
-          weekId,
-          weekFile: dest,
-          validation: weekValidation,
-        });
-        throw createHostedSqliteError('week-validation', `Week database invalid: ${weekValidation.reason}`, {
-          weekId,
-          weekFile: dest,
-          validation: weekValidation,
-        });
-      }
-      meta.installedWeeks = [
-        ...(meta.installedWeeks || []),
-        {
-          id: weekId,
-          startDate: week.startDate,
-          endDate: week.endDate,
-          fileName: week.fileName,
-        },
-      ];
-      installedWeekIds.add(weekId);
-      weeksChanged = true;
+  // B0 week-gap fix: a week covering a requested startup date that the
+  // month DB does not cover must be installed even when versionChanged
+  // (fresh install / version bump) — otherwise the first day outside the
+  // month span loads zero trips. Weeks not covering such a date keep the
+  // existing periodic gate. requestedDates is optional: callers without
+  // it (background flows) keep the old behavior exactly.
+  const requestedDates = (options.requestedDates || []).map((d) => String(d)).filter(Boolean);
+  const monthCoversDate = (ymd) => dateInSpan(ymd, manifest.month?.startDate, manifest.month?.endDate);
+  const weekCoversStartupGap = (week) =>
+    requestedDates.some((ymd) => !monthCoversDate(ymd) && dateInSpan(ymd, week.startDate, week.endDate));
+
+  for (const week of manifest.weeks || []) {
+    const weekId = String(week.id || week.startDate || '');
+    if (!weekId || installedWeekIds.has(weekId)) continue;
+    const coversStartupGap = weekCoversStartupGap(week);
+    if (!coversStartupGap && !(checkDue && !versionChanged)) continue;
+    if (coversStartupGap) {
+      logHostedSqlite('bundle:v2:download-week-startup-coverage', {
+        weekId,
+        startDate: week.startDate,
+        endDate: week.endDate,
+      });
     }
+    const dest = weekDbUri(week.startDate);
+    onProgress?.({ message: `Downloading week ${week.startDate}...`, percent: 0.55 });
+    await downloadBundleAsset(week, dest, onProgress, `week ${week.startDate}`);
+    const weekValidation = await validateDbTables(weekDbName(week.startDate), ['trips', 'stop_times']).catch(
+      (error) => ({ ok: false, reason: error?.message }),
+    );
+    if (!weekValidation.ok) {
+      await FileSystem.deleteAsync(dest, { idempotent: true }).catch(() => {});
+      logHostedSqlite('bundle:v2:week-validation-failed', {
+        weekId,
+        weekFile: dest,
+        validation: weekValidation,
+      });
+      throw createHostedSqliteError('week-validation', `Week database invalid: ${weekValidation.reason}`, {
+        weekId,
+        weekFile: dest,
+        validation: weekValidation,
+      });
+    }
+    meta.installedWeeks = [
+      ...(meta.installedWeeks || []),
+      {
+        id: weekId,
+        startDate: week.startDate,
+        endDate: week.endDate,
+        fileName: week.fileName,
+      },
+    ];
+    installedWeekIds.add(weekId);
+    weeksChanged = true;
   }
 
   meta = {
@@ -901,7 +919,7 @@ export async function ensureHostedSqlite(options = {}) {
     return { ok: false, reason: 'not-configured' };
   }
 
-  const { force = false, onProgress } = options;
+  const { force = false, onProgress, requestedDates } = options;
   onProgress?.({ message: 'Checking schedules database version...', percent: 0.02 });
   const manifest = await fetchRemoteManifest();
   if (!manifest) {
@@ -909,7 +927,7 @@ export async function ensureHostedSqlite(options = {}) {
   }
 
   if (manifest.format === 'v2') {
-    return ensureHostedBundleV2(manifest, { force, onProgress });
+    return ensureHostedBundleV2(manifest, { force, onProgress, requestedDates });
   }
 
   const localMeta = await readJson(LEGACY_META_FILE);

@@ -929,7 +929,7 @@ export default function TripDetailScreen() {
         line = '🔔 Get-off alert: setting up…';
         break;
       case 'on':
-        line = '🔔 Get-off alert on — updates at every stop';
+        line = '🔔 Get-off alert on — buzzes 1 stop before';
         break;
       case 'limited':
         // Android `limited` is the Directive F ask; iOS keeps the fix copy.
@@ -996,7 +996,7 @@ export default function TripDetailScreen() {
                 <>
                   <MaterialIcons name={tracking ? 'stop' : 'my-location'} size={20} color="#fff" />
                   <Text style={styles.trackText}>
-                    {tracking ? 'Tracking ✓ — tap to stop' : 'Track this Trip'}
+                    {tracking ? 'Tracking ✓ — tap to stop' : 'Buzz me before my stop'}
                   </Text>
                 </>
               )}

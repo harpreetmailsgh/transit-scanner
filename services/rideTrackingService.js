@@ -40,9 +40,10 @@ import {
 const RIDE_SESSION_FILE = `${FileSystem.documentDirectory}active-ride-v1.json`;
 const LOCATION_TASK_NAME = 'transitscanner-active-ride-location-task';
 const ENGINE_VERSION = 2;
-// Fixed notification identifier so each per-stop alert REPLACES the
-// previous one in the shade instead of stacking (Harpreet's 2026-10-26
-// call). Verified against the installed expo-notifications 0.32.17:
+// Fixed notification identifier so the single buzz REPLACES any previous
+// alert in the shade instead of stacking (Harpreet's 2026-10-26 call,
+// kept for the 1-stop buzz). Verified against the installed
+// expo-notifications 0.32.17:
 // JS passes `identifier` through (omitted => fresh UUID, which is why the
 // old code stacked); Android posts with notify(tag=identifier, id=0), so
 // the same tag+id replaces; iOS builds UNNotificationRequest with the
@@ -118,10 +119,10 @@ async function loadAlertSession() {
       : 'off',
     backgroundEnabled: Boolean(raw.backgroundEnabled ?? false),
     staleFeed: Boolean(raw.staleFeed ?? false),
-    // Per-stop dedup: the next stop last notified for. Old builds wrote
+    // F-DEST guard: the next stop last notified for. Old builds wrote
     // `sentLeadAlert` instead — that field is ignored on load, so a
-    // session written by the current build fires per-stop from its current
-    // next stop with no migration.
+    // session written by an older build fires only at F-DEST with no
+    // migration.
     lastNotifiedStopId: raw.lastNotifiedStopId ? String(raw.lastNotifiedStopId) : null,
     startedAt: Number(raw.startedAt) || 0,
     updatedAt: Number(raw.updatedAt) || 0,
@@ -131,6 +132,15 @@ async function loadAlertSession() {
 // ---------------------------------------------------------------------------
 // Notifications
 // ---------------------------------------------------------------------------
+
+// B1: ~2-second buzz (was a sub-second triple buzz). Android ignores
+// vibrationPattern changes on an already-created channel, so the pattern
+// is versioned on disk: when the stored version differs, the channel is
+// deleted and recreated (same id) so upgraded installs get the new
+// pattern too. Fresh installs have no stored version and create it once.
+const RIDE_ALERTS_CHANNEL_PATTERN = [0, 2000];
+const RIDE_ALERTS_CHANNEL_PATTERN_VERSION = 2;
+const RIDE_ALERTS_CHANNEL_VERSION_FILE = `${FileSystem.documentDirectory}ride-alerts-channel-version.json`;
 
 async function ensureNotificationConfig() {
   if (notificationConfigured) return;
@@ -143,12 +153,28 @@ async function ensureNotificationConfig() {
     }),
   });
 
+  let storedPatternVersion = 0;
+  try {
+    const raw = await FileSystem.readAsStringAsync(RIDE_ALERTS_CHANNEL_VERSION_FILE);
+    storedPatternVersion = Number(JSON.parse(raw)?.patternVersion) || 0;
+  } catch {}
+  if (storedPatternVersion !== RIDE_ALERTS_CHANNEL_PATTERN_VERSION && Platform.OS === 'android') {
+    await Notifications.deleteNotificationChannelAsync('ride-alerts').catch(() => {});
+  }
+
   await Notifications.setNotificationChannelAsync('ride-alerts', {
     name: 'Ride Alerts',
     importance: Notifications.AndroidImportance.HIGH,
-    vibrationPattern: [0, 250, 250, 250],
+    vibrationPattern: RIDE_ALERTS_CHANNEL_PATTERN,
     lockscreenVisibility: Notifications.AndroidNotificationVisibility.PUBLIC,
   });
+
+  if (storedPatternVersion !== RIDE_ALERTS_CHANNEL_PATTERN_VERSION) {
+    await FileSystem.writeAsStringAsync(
+      RIDE_ALERTS_CHANNEL_VERSION_FILE,
+      JSON.stringify({ patternVersion: RIDE_ALERTS_CHANNEL_PATTERN_VERSION }),
+    ).catch(() => {});
+  }
 
   notificationConfigured = true;
 }
@@ -162,7 +188,11 @@ async function sendRideNotification(title, body) {
     content: {
       title,
       body,
-      sound: 'default',
+      // B1: iOS plays the bundled ~2s tone (Dev-1, B2); Android keeps
+      // 'default' — its buzz length comes from the channel vibration
+      // pattern, not the sound. A build without the bundled tone falls
+      // back to the default iOS sound.
+      sound: Platform.OS === 'ios' ? 'alert_2s.caf' : 'default',
       priority: Notifications.AndroidNotificationPriority.HIGH,
     },
     // Immediate delivery routed through the 'ride-alerts' channel on Android.
@@ -460,29 +490,8 @@ export async function evaluateAlertsFromFeed() {
       return;
     }
 
-    // Per-stop alerts (ADDENDUM-per-stop-alerts.md §2–§8): fire once per
-    // next-stop change, naming the upcoming stop. The final fire, on the
-    // stopsRemaining === 0 tick, names the destination itself (see the
-    // F-DEST block above — that tick ends the session, so the fire must
-    // happen before the end, not in this block). Repeated ticks at the same
-    // next stop never re-fire; missing next-stop data fires nothing, never
-    // a blank-name notification. The old exactly-once-at-1-stop rule and
-    // its sentLeadAlert gate are gone; leadStopsBefore is no longer
-    // consulted for firing.
-    const nextStopId = state.ok && state.nextStopId ? String(state.nextStopId) : null;
-    const nextStopName =
-      state.ok && state.nextStopName ? String(state.nextStopName).trim() : '';
-    if (
-      nextStopId &&
-      nextStopName &&
-      (session.alertState === 'on' || session.alertState === 'limited') &&
-      session.lastNotifiedStopId !== nextStopId
-    ) {
-      await sendRideNotification('Track my Trip', `Up next ${nextStopName}`);
-      session.lastNotifiedStopId = nextStopId;
-      dirty = true;
-      debugLog('Per-stop alert fired', { tripId: session.tripId, nextStopId });
-    }
+    // B1: no per-stop fires remain — the F-DEST block above is the only
+    // fire in the engine. Ticks at any other next stop fire nothing.
 
     if (dirty) {
       session.updatedAt = nowMs();
@@ -529,6 +538,7 @@ export async function startAlertsForTrip(args = {}) {
     const tripId = String(args?.tripId || '').trim();
     const fromStopId = String(args?.fromStopId || '').trim();
     const toStopId = String(args?.toStopId || '').trim();
+    debugLog('startAlertsForTrip entry', { tripId, fromStopId, toStopId });
     if (!tripId || !fromStopId) {
       return { armed: false, alertState: 'off', backgroundEnabled: false };
     }
@@ -544,8 +554,20 @@ export async function startAlertsForTrip(args = {}) {
     }
     const stopsCount = state && Array.isArray(state.stops) ? state.stops.length : 0;
     if (!state || !state.ok || stopsCount < 2) {
+      debugLog('startAlertsForTrip compute gate failed', {
+        tripId,
+        ok: state?.ok ?? false,
+        reason: state?.reason ?? null,
+        stopsCount,
+      });
       return { armed: false, alertState: 'off', backgroundEnabled: false };
     }
+    debugLog('startAlertsForTrip compute ok', {
+      tripId,
+      ok: state.ok,
+      reason: state.reason ?? null,
+      stopsCount,
+    });
 
     const existing = await readSessionRaw();
     if (existing) {

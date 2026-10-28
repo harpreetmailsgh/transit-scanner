@@ -11,6 +11,7 @@ import React, { createContext, useContext, useEffect, useMemo, useRef, useState 
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Location from 'expo-location';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { DateTime } from 'luxon';
 
 import {
   invalidateActiveGtfsLoad,
@@ -18,6 +19,7 @@ import {
   getGtfsStartupDiagnostics,
   getStops as getStaticStops,
 } from '../services/gtfsService';
+import { ensureHostedSqlite } from '../services/gtfsSqliteService';
 import { loadBootstrapStops } from '../services/stopsBootstrapService';
 import {
   startRealtimeUpdates,
@@ -128,6 +130,7 @@ export function GtfsDataProvider({ children }) {
   const startupTraceRef = useRef([]);
   const finishedRef = useRef(false);
   const telemetryReportedRef = useRef(false);
+  const recoveryInFlightRef = useRef(false);
 
   const appendStartupTrace = React.useCallback((line) => {
     const timestamp = new Date().toISOString();
@@ -147,8 +150,32 @@ export function GtfsDataProvider({ children }) {
   }, []);
 
   const retryLoad = React.useCallback(() => {
+    // B5 recovery: a retry from the error screen must not just re-run the
+    // local-first load. On an existing install past a month boundary the
+    // local core/month DBs are valid but lack the covering week, so the
+    // load throws the loud zero-trips error again and the user is trapped
+    // until reinstall. Run a manifest-backed ensure FIRST (best-effort):
+    // with today as a requested date it downloads the covering week when
+    // the month span does not cover today, without re-downloading
+    // core/month. The load below then finds the week locally and succeeds.
+    // If the ensure fails (offline, manifest unavailable), proceed to the
+    // load anyway — it throws the real error again, never a silent
+    // 0-stops screen. Taps while a recovery ensure is in flight are
+    // ignored, so rapid taps cannot stack ensures or loads; each tap is
+    // one ensure + one load, and nothing retries automatically.
+    if (recoveryInFlightRef.current) return;
+    recoveryInFlightRef.current = true;
     invalidateActiveGtfsLoad();
-    setLoadAttempt((n) => n + 1);
+    // Same Toronto-date computation as gtfsService's torontoTodayYmd
+    // (same library, zone, and format), so the requested date matches the
+    // load path's startup dates exactly.
+    const today = DateTime.now().setZone('America/Toronto').toFormat('yyyyMMdd');
+    ensureHostedSqlite({ requestedDates: [today] })
+      .catch(() => {})
+      .finally(() => {
+        recoveryInFlightRef.current = false;
+        setLoadAttempt((n) => n + 1);
+      });
   }, []);
 
   useEffect(() => {

@@ -43,6 +43,10 @@ jobs:
           prerelease: false
           make_latest: false
           overwrite_files: true
+          # The builder omits the week artifact when the feed's horizon ends
+          # before the trailing week window (zero trips); without this, the
+          # unmatched week glob fails the publish even though build+verify pass.
+          fail_on_unmatched_files: false
           files: |
             dist/gtfs/go-gtfs-core.sqlite
             dist/gtfs/go-gtfs-month.sqlite

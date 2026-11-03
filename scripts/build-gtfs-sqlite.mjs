@@ -452,25 +452,38 @@ async function main() {
     },
   );
 
-  const weekFileName = `go-gtfs-week-${weekStart}.sqlite`;
-  const weekPath = path.join(OUTPUT_DIR, weekFileName);
-  console.log('[gtfs] Building week artifact', { weekStart, weekEnd });
-  const week = buildArtifact(
-    weekPath,
-    createScheduleSchema,
-    (db) => {
-      insertRows(db, 'routes', routes);
-      insertRows(db, 'trips', weekFiltered.trips);
-      insertRows(db, 'stop_times', weekFiltered.stopTimes);
-      writeMeta(db, {
-        tripsCount: weekFiltered.trips.length,
-        stopTimesCount: weekFiltered.stopTimes.length,
-        startDate: weekStart,
-        endDate: weekEnd,
-        artifact: 'week',
-      });
-    },
-  );
+  // The live feed covers a fixed horizon (feed_info feed_end_date; when the
+  // feed has no calendar.txt, calendar_dates alone). Once the trailing week
+  // window (days 31-37 after build) falls past that horizon, the week has
+  // zero trips. Writing that empty artifact fails verification and blocks
+  // publishing the month data that does exist, so skip the artifact and
+  // omit it from the manifest instead. Verify already skips missing
+  // artifacts, and the app tolerates weeks: [].
+  let week = null;
+  let weekPath = null;
+  if (weekFiltered.trips.length > 0) {
+    const weekFileName = `go-gtfs-week-${weekStart}.sqlite`;
+    weekPath = path.join(OUTPUT_DIR, weekFileName);
+    console.log('[gtfs] Building week artifact', { weekStart, weekEnd });
+    week = buildArtifact(
+      weekPath,
+      createScheduleSchema,
+      (db) => {
+        insertRows(db, 'routes', routes);
+        insertRows(db, 'trips', weekFiltered.trips);
+        insertRows(db, 'stop_times', weekFiltered.stopTimes);
+        writeMeta(db, {
+          tripsCount: weekFiltered.trips.length,
+          stopTimesCount: weekFiltered.stopTimes.length,
+          startDate: weekStart,
+          endDate: weekEnd,
+          artifact: 'week',
+        });
+      },
+    );
+  } else {
+    console.log('[gtfs] Skipping week artifact: no trips in feed for', { weekStart, weekEnd });
+  }
 
   const manifest = {
     version: VERSION,
@@ -486,15 +499,17 @@ async function main() {
       startDate: monthStart,
       endDate: monthEnd,
     },
-    weeks: [
-      {
-        id: weekStart,
-        ...week,
-        url: assetUrl(week.fileName),
-        startDate: weekStart,
-        endDate: weekEnd,
-      },
-    ],
+    weeks: week
+      ? [
+          {
+            id: weekStart,
+            ...week,
+            url: assetUrl(week.fileName),
+            startDate: weekStart,
+            endDate: weekEnd,
+          },
+        ]
+      : [],
   };
 
   fs.writeFileSync(MANIFEST_FILE_PATH, JSON.stringify(manifest, null, 2));
@@ -502,7 +517,9 @@ async function main() {
   console.log('[gtfs] Done');
   console.log(`[gtfs] Core: ${corePath} (${core.sizeBytes} bytes)`);
   console.log(`[gtfs] Month: ${monthPath} (${month.sizeBytes} bytes)`);
-  console.log(`[gtfs] Week: ${weekPath} (${week.sizeBytes} bytes)`);
+  if (week) {
+    console.log(`[gtfs] Week: ${weekPath} (${week.sizeBytes} bytes)`);
+  }
   console.log(`[gtfs] Manifest: ${MANIFEST_FILE_PATH}`);
 }
 

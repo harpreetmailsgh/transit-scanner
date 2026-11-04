@@ -22,6 +22,10 @@ const RELEASE_BASE = (process.env.GTFS_RELEASE_BASE || '').replace(/\/$/, '');
 const BUILD_DATE = process.env.BUILD_DATE || torontoTodayYmd();
 const MONTH_DAY_COUNT = 30;
 const WEEK_DAY_COUNT = 7;
+// Phase 1 transition: the manifest still carries a 30-day `month` artifact
+// (old-version phones parse it and behave as today), but the schedule
+// coverage the new app uses is exactly two 7-day weeks from BUILD_DATE.
+const WEEK_COUNT = 2;
 
 const CORE_FILE_NAME = 'go-gtfs-core.sqlite';
 const MONTH_FILE_NAME = 'go-gtfs-month.sqlite';
@@ -122,6 +126,19 @@ function createCoreSchema(db) {
       service_id TEXT,
       date TEXT,
       exception_type TEXT
+    );
+
+    -- Stop -> served route_type pairs, derived from the FULL feed (all
+    -- trips/stop_times, not just the active-service windows). The app
+    -- seeds its stop classification from this table at core load, so bus
+    -- stops/pins are visible before any bus schedule slice has loaded —
+    -- otherwise, before the first bus week lands, no stop classifies as
+    -- bus-served and the bus surfaces would hide everything. Additive
+    -- only: old clients SELECT specific tables and ignore this one, so
+    -- the core contract for them is unchanged.
+    CREATE TABLE stop_route_types (
+      stop_id TEXT,
+      route_type TEXT
     );
 
     CREATE TABLE app_meta (
@@ -328,6 +345,63 @@ function insertRows(db, name, rows) {
     });
     tx(rows);
   }
+
+  if (name === 'stop_route_types') {
+    const stmt = db.prepare(`
+      INSERT INTO stop_route_types (stop_id, route_type)
+      VALUES (?, ?)
+    `);
+    const tx = db.transaction((items) => {
+      for (const row of items) {
+        stmt.run(toStr(row.stop_id), toStr(row.route_type));
+      }
+    });
+    tx(rows);
+  }
+}
+
+// Route-type split of a service-filtered week: keep only trips whose route
+// is of the given GTFS route_type (2 = train, 3 = bus), then only the
+// stop_times of those surviving trips, then only routes of that type (so
+// the loader's trips JOIN routes stays truthful per file). Returns the
+// mode-filtered rows; the caller gates on non-emptiness.
+function filterByRouteType(filtered, routes, routeType) {
+  const routeTypeByRouteId = new Map(
+    routes.map((r) => [String(r.route_id), Number(r.route_type)]),
+  );
+  const trips = filtered.trips.filter(
+    (t) => routeTypeByRouteId.get(String(t.route_id)) === routeType,
+  );
+  const tripIds = new Set(trips.map((t) => String(t.trip_id)));
+  const stopTimes = filtered.stopTimes.filter((st) => tripIds.has(String(st.trip_id)));
+  const modeRoutes = routes.filter((r) => Number(r.route_type) === routeType);
+  return { trips, stopTimes, routes: modeRoutes };
+}
+
+// Distinct stop -> route_type pairs over the whole feed (see the core
+// schema comment on stop_route_types). Built from trip route types, not
+// from the active-service windows, so classification is complete.
+function buildStopRouteTypes(trips, stopTimes, routes) {
+  const routeTypeByRouteId = new Map(
+    routes.map((r) => [String(r.route_id), Number(r.route_type)]),
+  );
+  const routeTypeByTripId = new Map();
+  for (const trip of trips) {
+    const routeType = routeTypeByRouteId.get(String(trip.route_id));
+    if (Number.isFinite(routeType)) {
+      routeTypeByTripId.set(String(trip.trip_id), routeType);
+    }
+  }
+  const pairs = new Set();
+  for (const st of stopTimes) {
+    const routeType = routeTypeByTripId.get(String(st.trip_id));
+    if (routeType === undefined) continue;
+    pairs.add(`${String(st.stop_id)}|${routeType}`);
+  }
+  return [...pairs].map((pair) => {
+    const [stop_id, route_type] = pair.split('|');
+    return { stop_id, route_type };
+  });
 }
 
 function writeMeta(db, stats) {
@@ -349,9 +423,16 @@ function finalizeDb(db) {
   db.exec('VACUUM;');
 }
 
-function sha256ForFile(filePath) {
+function hashesForFile(filePath) {
+  // One read, both hashes. sha256 is the manifest's primary checksum;
+  // md5 is ALSO published because the app can verify it natively via
+  // expo-file-system's getInfoAsync({ md5: true }) without loading the
+  // whole file into JS memory (sha256 has no such on-device API).
   const buf = fs.readFileSync(filePath);
-  return crypto.createHash('sha256').update(buf).digest('hex');
+  return {
+    checksumSha256: crypto.createHash('sha256').update(buf).digest('hex'),
+    checksumMd5: crypto.createHash('md5').update(buf).digest('hex'),
+  };
 }
 
 function buildArtifact(filePath, schemaFn, writeFn) {
@@ -370,7 +451,7 @@ function buildArtifact(filePath, schemaFn, writeFn) {
   return {
     fileName: path.basename(filePath),
     sizeBytes: stat.size,
-    checksumSha256: sha256ForFile(filePath),
+    ...hashesForFile(filePath),
   };
 }
 
@@ -406,15 +487,67 @@ async function main() {
 
   const monthStart = BUILD_DATE;
   const monthEnd = addDaysYmd(monthStart, MONTH_DAY_COUNT - 1);
-  const weekStart = addDaysYmd(monthEnd, 1);
-  const weekEnd = addDaysYmd(weekStart, WEEK_DAY_COUNT - 1);
+
+  // Exactly two consecutive 7-day weeks from BUILD_DATE: week 1 = days 1-7,
+  // week 2 = days 8-14. These replace the old month + tail-week layout as
+  // the app's coverage (the month artifact below is retained only for
+  // old-version phones during the Phase 1 transition).
+  const weekSpans = [];
+  for (let i = 0; i < WEEK_COUNT; i += 1) {
+    const weekStart = addDaysYmd(BUILD_DATE, i * WEEK_DAY_COUNT);
+    const weekEnd = addDaysYmd(weekStart, WEEK_DAY_COUNT - 1);
+    weekSpans.push({ weekStart, weekEnd });
+  }
 
   const monthServices = unionActiveServiceIdsForDays(monthStart, MONTH_DAY_COUNT, calendar, calendarDates);
-  const weekServices = unionActiveServiceIdsForDays(weekStart, WEEK_DAY_COUNT, calendar, calendarDates);
   const monthFiltered = filterTripsAndStopTimes(trips, stopTimes, monthServices);
-  const weekFiltered = filterTripsAndStopTimes(trips, stopTimes, weekServices);
+  // Trains-only first download: each 7-day week is published twice, once
+  // per mode (train = route_type 2, bus = route_type 3), under distinct
+  // filenames — the old single name collided across modes. Four artifacts
+  // per release: train+bus x 2 consecutive weeks.
+  const MODE_WEEKS = [
+    { mode: 'train', routeType: 2 },
+    { mode: 'bus', routeType: 3 },
+  ];
+  const weekFilteredList = [];
+  for (const { weekStart, weekEnd } of weekSpans) {
+    const services = unionActiveServiceIdsForDays(weekStart, WEEK_DAY_COUNT, calendar, calendarDates);
+    const serviceFiltered = filterTripsAndStopTimes(trips, stopTimes, services);
+    for (const { mode, routeType } of MODE_WEEKS) {
+      weekFilteredList.push({
+        weekStart,
+        weekEnd,
+        mode,
+        filtered: filterByRouteType(serviceFiltered, routes, routeType),
+      });
+    }
+  }
+
+  // Release gate: BLOCKED unless ALL FOUR mode-weeks are non-empty
+  // (minimum 14 days from build date, both modes). The feed max calendar
+  // date is a diagnostic only and never gates the release.
+  let feedMaxDate = '';
+  for (const row of calendar) {
+    const d = String(row.end_date || '');
+    if (d && d > feedMaxDate) feedMaxDate = d;
+  }
+  for (const row of calendarDates) {
+    const d = String(row.date || '');
+    if (d && d > feedMaxDate) feedMaxDate = d;
+  }
+  console.log(`[gtfs] Feed max calendar date (diagnostic only): ${feedMaxDate || '(none)'}`);
+  for (const { weekStart, weekEnd, mode, filtered } of weekFilteredList) {
+    if (filtered.trips.length === 0 || filtered.stopTimes.length === 0) {
+      throw new Error(
+        `GTFS build BLOCKED: week ${weekStart}..${weekEnd} (${mode}) is empty ` +
+          `(${filtered.trips.length} trips, ${filtered.stopTimes.length} stop_times). ` +
+          'All four mode-weeks must be non-empty (minimum 14 days from build date, both modes).',
+      );
+    }
+  }
 
   console.log('[gtfs] Building core artifact');
+  const stopRouteTypes = buildStopRouteTypes(trips, stopTimes, routes);
   const corePath = path.join(OUTPUT_DIR, CORE_FILE_NAME);
   const core = buildArtifact(
     corePath,
@@ -425,9 +558,11 @@ async function main() {
       insertRows(db, 'pathways', pathways);
       insertRows(db, 'calendar', calendar);
       insertRows(db, 'calendar_dates', calendarDates);
+      insertRows(db, 'stop_route_types', stopRouteTypes);
       writeMeta(db, {
         stopsCount: stops.length,
         routesCount: routes.length,
+        stopRouteTypesCount: stopRouteTypes.length,
         artifact: 'core',
       });
     },
@@ -452,38 +587,42 @@ async function main() {
     },
   );
 
-  // The live feed covers a fixed horizon (feed_info feed_end_date; when the
-  // feed has no calendar.txt, calendar_dates alone). Once the trailing week
-  // window (days 31-37 after build) falls past that horizon, the week has
-  // zero trips. Writing that empty artifact fails verification and blocks
-  // publishing the month data that does exist, so skip the artifact and
-  // omit it from the manifest instead. Verify already skips missing
-  // artifacts, and the app tolerates weeks: [].
-  let week = null;
-  let weekPath = null;
-  if (weekFiltered.trips.length > 0) {
-    const weekFileName = `go-gtfs-week-${weekStart}.sqlite`;
-    weekPath = path.join(OUTPUT_DIR, weekFileName);
-    console.log('[gtfs] Building week artifact', { weekStart, weekEnd });
-    week = buildArtifact(
+  const weeks = weekFilteredList.map(({ weekStart, weekEnd, mode, filtered }) => {
+    const weekFileName = `go-gtfs-week-${weekStart}-${mode}.sqlite`;
+    const weekPath = path.join(OUTPUT_DIR, weekFileName);
+    console.log('[gtfs] Building week artifact', { weekStart, weekEnd, mode });
+    const week = buildArtifact(
       weekPath,
       createScheduleSchema,
       (db) => {
-        insertRows(db, 'routes', routes);
-        insertRows(db, 'trips', weekFiltered.trips);
-        insertRows(db, 'stop_times', weekFiltered.stopTimes);
+        insertRows(db, 'routes', filtered.routes);
+        insertRows(db, 'trips', filtered.trips);
+        insertRows(db, 'stop_times', filtered.stopTimes);
         writeMeta(db, {
-          tripsCount: weekFiltered.trips.length,
-          stopTimesCount: weekFiltered.stopTimes.length,
+          tripsCount: filtered.trips.length,
+          stopTimesCount: filtered.stopTimes.length,
           startDate: weekStart,
           endDate: weekEnd,
+          mode,
           artifact: 'week',
         });
       },
     );
-  } else {
-    console.log('[gtfs] Skipping week artifact: no trips in feed for', { weekStart, weekEnd });
-  }
+    console.log(`[gtfs] Week: ${weekPath} (${week.sizeBytes} bytes)`);
+    return {
+      id: `${weekStart}-${mode}`,
+      ...week,
+      url: assetUrl(week.fileName),
+      startDate: weekStart,
+      endDate: weekEnd,
+      mode,
+    };
+  });
+  weeks.sort((a, b) =>
+    a.startDate !== b.startDate
+      ? (a.startDate < b.startDate ? -1 : 1)
+      : (a.mode < b.mode ? -1 : a.mode > b.mode ? 1 : 0),
+  );
 
   const manifest = {
     version: VERSION,
@@ -499,27 +638,15 @@ async function main() {
       startDate: monthStart,
       endDate: monthEnd,
     },
-    weeks: week
-      ? [
-          {
-            id: weekStart,
-            ...week,
-            url: assetUrl(week.fileName),
-            startDate: weekStart,
-            endDate: weekEnd,
-          },
-        ]
-      : [],
+    weeks,
   };
 
   fs.writeFileSync(MANIFEST_FILE_PATH, JSON.stringify(manifest, null, 2));
 
   console.log('[gtfs] Done');
   console.log(`[gtfs] Core: ${corePath} (${core.sizeBytes} bytes)`);
-  console.log(`[gtfs] Month: ${monthPath} (${month.sizeBytes} bytes)`);
-  if (week) {
-    console.log(`[gtfs] Week: ${weekPath} (${week.sizeBytes} bytes)`);
-  }
+  console.log(`[gtfs] Month (Phase 1 transition only): ${monthPath} (${month.sizeBytes} bytes)`);
+  console.log(`[gtfs] Weeks: ${weeks.map((w) => `${w.startDate}..${w.endDate} (${w.mode})`).join(', ')}`);
   console.log(`[gtfs] Manifest: ${MANIFEST_FILE_PATH}`);
 }
 

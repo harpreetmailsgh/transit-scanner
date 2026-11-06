@@ -3,7 +3,7 @@
     "name": "Transit Scanner",
     "slug": "TrackTransit",
     "scheme": "transitscanner",
-    "version": "1.1",
+    "version": "1.2",
     "runtimeVersion": {
       "policy": "appVersion"
     },
@@ -76,7 +76,9 @@
         {
           "icon": "./assets/icon.png",
           "color": "#00853F",
-          "sounds": ["./assets/sounds/alert_2s.caf"]
+          "sounds": [
+            "./assets/sounds/alert_2s.caf"
+          ]
         }
       ],
       [

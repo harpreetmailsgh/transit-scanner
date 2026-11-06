@@ -1,9 +1,16 @@
 /**
- * Silent startup telemetry (backend only — no UI).
+ * Startup telemetry: one silent backend report per successful launch, plus
+ * an in-memory record of the last launch's timings for in-app display
+ * (no storage, no network for the display path — it only re-reads values
+ * already computed at ready).
  *
  * After the GTFS startup sequence completes, reports one anonymous timing row
- * to the `transit_startup_timings` table:
- *   { device_id, app_version, platform, total_ms, stops_ms, schedules_ms }
+ * to the `startup_timings` table in the dedicated "Transit Scanner" project:
+ *   { app_version, platform, total_ms, stops_ms, schedules_ms }
+ * (timing_date is left to the server default — never sent.)
+ *
+ * There is NO id of any kind in the payload: no device id, no user id, no
+ * install id. Nothing here points at any other project's table.
  *
  * Everything here is fail-silent by design:
  * - If EXPO_PUBLIC_SUPABASE_URL / EXPO_PUBLIC_SUPABASE_ANON_KEY are unset,
@@ -14,43 +21,15 @@
 
 import { Platform } from 'react-native';
 import Constants from 'expo-constants';
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import { createClient } from '@supabase/supabase-js';
 
 const SUPABASE_URL = (process.env.EXPO_PUBLIC_SUPABASE_URL || '').trim();
 const SUPABASE_ANON_KEY = (process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY || '').trim();
-const INSTALL_ID_KEY = 'telemetry-install-id';
-const TIMINGS_TABLE = 'transit_startup_timings';
+const TIMINGS_TABLE = 'startup_timings';
 const REPORT_TIMEOUT_MS = 8000;
 
 function isConfigured() {
   return Boolean(SUPABASE_URL && SUPABASE_ANON_KEY);
-}
-
-function randomUuidV4() {
-  // Math.random-based v4 UUID (no crypto dependency needed for an opaque id).
-  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
-    const r = Math.floor(Math.random() * 16);
-    const v = c === 'x' ? r : (r & 0x3) | 0x8;
-    return v.toString(16);
-  });
-}
-
-/**
- * Stable anonymous install id, generated once and persisted.
- * Returns null when telemetry is not configured or storage fails.
- */
-export async function getInstallId() {
-  if (!isConfigured()) return null;
-  try {
-    const existing = await AsyncStorage.getItem(INSTALL_ID_KEY);
-    if (existing) return existing;
-    const id = randomUuidV4();
-    await AsyncStorage.setItem(INSTALL_ID_KEY, id);
-    return id;
-  } catch {
-    return null;
-  }
 }
 
 function getAppVersion() {
@@ -71,6 +50,28 @@ function toMs(value) {
 }
 
 /**
+ * Last launch's timings, kept in memory only. The display path (context +
+ * departures footer) reads these via getLastStartupTiming — no storage,
+ * no network, no recomputation. A fresh app launch overwrites them at
+ * ready; before the first ready they are null.
+ */
+let lastStartupTiming = null;
+
+export function recordStartupTiming({ totalMs, stopsMs, schedulesMs } = {}) {
+  const next = {
+    totalMs: toMs(totalMs),
+    stopsMs: toMs(stopsMs),
+    schedulesMs: toMs(schedulesMs),
+  };
+  lastStartupTiming = next;
+  return { ...next };
+}
+
+export function getLastStartupTiming() {
+  return lastStartupTiming ? { ...lastStartupTiming } : null;
+}
+
+/**
  * Fire-and-forget safe: inserts one timing row. Never rejects, never throws.
  * Resolves null when unconfigured, on any error, or on timeout.
  */
@@ -79,13 +80,10 @@ export async function reportStartupTiming({ totalMs, stopsMs, schedulesMs } = {}
 
   const run = (async () => {
     try {
-      const deviceId = await getInstallId();
-      if (!deviceId) return null;
       const client = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
         auth: { persistSession: false },
       });
       const { error } = await client.from(TIMINGS_TABLE).insert({
-        device_id: deviceId,
         app_version: getAppVersion(),
         platform: String(Platform.OS || 'unknown'),
         total_ms: toMs(totalMs),

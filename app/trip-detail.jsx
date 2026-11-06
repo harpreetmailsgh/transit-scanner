@@ -28,6 +28,7 @@ import TripResultCard from '../components/TripResultCard';
 import { DateTime } from 'luxon';
 
 import { useGtfsData } from '../contexts/GtfsDataContext';
+import { recordScreenView } from '../services/usageCounts';
 import { getTripSegmentServicePattern, getTripStops } from '../services/gtfsService';
 import { getPlatformMatchForStop, getStopNextService } from '../services/metrolinxApiService';
 import { getDelayForStop } from '../services/gtfsRealtimeService';
@@ -464,6 +465,15 @@ export default function TripDetailScreen() {
     if (rtTick === 0) return;
     refreshTrackingState();
   }, [rtTick, refreshTrackingState]);
+
+  // Anonymous usage count: one 'trip-detail' screen row per focus.
+  // No UI, no state, no effect on the screen's own work. Kept separate
+  // from the focus effect below so it never disturbs it.
+  useFocusEffect(
+    useCallback(() => {
+      recordScreenView('trip-detail');
+    }, []),
+  );
 
   // UI-7: re-derive on screen focus. On Android this is also the Directive F
   // return path: if the user granted "Always" location in system Settings

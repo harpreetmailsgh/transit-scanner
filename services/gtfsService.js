@@ -19,10 +19,13 @@ import {
   applyPendingHostedSqliteUpdate,
   checkHostedSqliteUpdate,
   clearPendingHostedSqliteUpdate,
+  ensureBusWeeksForDates,
   ensureHostedSqlite,
   ensureLocalHostedSqlite,
   getBundleMeta,
+  getBusDownloadState,
   getEffectiveCoverageEnd,
+  getModeCoverageEnd,
   getPendingHostedSqliteUpdate,
   isHostedSqliteConfigured,
   loadHostedCoreTables,
@@ -148,13 +151,34 @@ function clamp01(value) {
   return n;
 }
 
-function emitProgress(onProgress, message, percent) {
+// Startup step keys for the splash screen (item 4a). The service only
+// tags events it knows; the context maps untagged/legacy messages by
+// text as a fallback. `step` is display metadata only — it never changes
+// what is loaded. Every call is guarded so a progress-reporting failure
+// can never break startup itself.
+const STARTUP_STEP_CHECKING = 'checking';
+const STARTUP_STEP_DOWNLOADING = 'downloading';
+const STARTUP_STEP_LOADING = 'loading';
+
+function emitProgress(onProgress, message, percent, step) {
   if (!onProgress) return;
-  if (Number.isFinite(percent)) {
-    onProgress({ message, percent: clamp01(percent) });
-    return;
+  try {
+    if (Number.isFinite(percent)) {
+      onProgress(
+        step
+          ? { message, percent: clamp01(percent), step }
+          : { message, percent: clamp01(percent) },
+      );
+      return;
+    }
+    if (step) {
+      onProgress({ message, step });
+      return;
+    }
+    onProgress(message);
+  } catch {
+    // Progress reporting must never break the load in progress.
   }
-  onProgress(message);
 }
 
 function isLikelyOutOfMemoryError(err) {
@@ -329,13 +353,26 @@ export function isSchedulesReady() {
   return schedulesReadyFlag;
 }
 
+/** Core-seeded stop -> route_type classification (see hydrateCoreData).
+ * Restored (not wiped) by clearLoadedScheduleKeys so the classification
+ * survives a schedule reset even before any schedule slice reloads. */
+let seededRouteTypesByStopId = new Map();
+
+function copyRouteTypesByStopId(source) {
+  const copy = new Map();
+  for (const [stopId, types] of source.entries()) {
+    copy.set(stopId, new Set(types));
+  }
+  return copy;
+}
+
 export function clearLoadedScheduleKeys() {
   loadedScheduleKeys.clear();
   scheduleLoadQueue = Promise.resolve();
   stopTimesByStopId = new Map();
   stopTimesByTripId = new Map();
   tripsById = new Map();
-  routeTypesByStopId = new Map();
+  routeTypesByStopId = copyRouteTypesByStopId(seededRouteTypesByStopId);
   indexedStopTimeKeys.clear();
 }
 
@@ -350,15 +387,67 @@ function getCoverageEndYmd() {
   return end || torontoTodayYmd();
 }
 
-function getSlidingWindowDates(centerYmd, radius = 3) {
+// Per-mode coverage end from the cached bundle meta (month span counts as
+// a both-modes fallback while the month file is installed). A mode with no
+// contiguous coverage from today reports null — callers fall back to today
+// for that mode, never to the other mode's end.
+function getPerModeCoverageEnd(mode) {
+  try {
+    return getModeCoverageEnd(cachedBundleMeta, mode);
+  } catch {
+    return null;
+  }
+}
+
+// Coverage end for a requested mode set: the MINIMUM across requested
+// modes, with a missing mode counting as today. So train-only → trainEnd,
+// bus-only → busEnd, both → min(trainEnd, busEnd): the picker can never
+// offer a date one selected mode cannot serve.
+function getCoverageEndForModes(modes) {
+  const filter = modesToScheduleFilter(modes);
   const today = torontoTodayYmd();
-  const coverageEnd = getCoverageEndYmd();
-  const monthStart = cachedBundleMeta?.month?.startDate || today;
+  const ends = [];
+  if (filter.train) ends.push(getPerModeCoverageEnd('train') || today);
+  if (filter.bus) ends.push(getPerModeCoverageEnd('bus') || today);
+  if (!ends.length) return today;
+  return ends.reduce((min, end) => (end < min ? end : min), ends[0]);
+}
+
+export function isScheduleLoaded(ymd, mode) {
+  return loadedScheduleKeys.has(`${String(ymd)}:${String(mode)}`);
+}
+
+/**
+ * Re-reads bundle meta from disk into the module cache. Called after a
+ * post-ready prefetch lands (e.g. next week's file) so getPlanningDateBounds
+ * — which is synchronous and reads the cached meta — reflects the new
+ * installed coverage without an app restart. Never throws: callers treat
+ * a failed refresh as "coverage unchanged".
+ */
+export async function refreshCachedBundleMeta() {
+  try {
+    cachedBundleMeta = await getBundleMeta();
+  } catch {
+    // Keep the previous cached meta; bounds simply do not extend yet.
+  }
+  return cachedBundleMeta;
+}
+
+function getSlidingWindowDates(centerYmd, radius = 3, modes) {
+  const today = torontoTodayYmd();
+  // Per-mode clamp: the window never extends past what the REQUESTED
+  // modes cover (min across them), so a bus load never claims train-only
+  // coverage or vice versa.
+  const coverageEnd = modes ? getCoverageEndForModes(modes) : getCoverageEndYmd();
+  // Sliding window: radius 3 around the centre, clamped to [today,
+  // installed coverage end]. There is deliberately NO month clamp here:
+  // the month artifact is gone from the app's coverage model, so a
+  // month-start floor would be meaningless (and would wrongly exclude
+  // dates before a stale month span).
   let minYmd = addDaysYmd(centerYmd, -radius);
   let maxYmd = addDaysYmd(centerYmd, radius);
   if (minYmd < today) minYmd = today;
   if (maxYmd > coverageEnd) maxYmd = coverageEnd;
-  if (minYmd < monthStart) minYmd = monthStart;
 
   const dates = [];
   let dt = DateTime.fromFormat(minYmd, 'yyyyMMdd', { zone: 'America/Toronto' });
@@ -370,9 +459,14 @@ function getSlidingWindowDates(centerYmd, radius = 3) {
   return dates;
 }
 
-export function getPlanningDateBounds() {
+export function getPlanningDateBounds(modes) {
   const today = torontoTodayYmd();
-  const coverageEnd = getCoverageEndYmd();
+  // Per-mode max: train-only → trainEnd, bus-only → busEnd, both (or no
+  // modes arg) → min(trainEnd, busEnd). The search screen passes its
+  // selectedModes, so its default {train: true, bus: false} yields the
+  // train end. Tapping a date NEVER triggers a download — dates beyond
+  // max stay disabled (the picker guards onPress), exactly as before.
+  const coverageEnd = modes ? getCoverageEndForModes(modes) : getCoverageEndYmd();
   let feedMax = coverageEnd;
   for (const row of calendarDatesRows) {
     const d = String(row.date || '');
@@ -413,10 +507,15 @@ function datesNeedingLoad(dates, modes) {
 export async function ensureSchedulesForDate(ymd, options = {}) {
   const run = async () => {
     const modes = modesToScheduleFilter(options.modes);
-    const windowDates = getSlidingWindowDates(ymd, 3);
+    const windowDates = getSlidingWindowDates(ymd, 3, modes);
+    if (!windowDates.length) {
+      // Centre outside [today, coverage end]: nothing loadable, and
+      // nothing is marked loaded. No download is ever attempted here.
+      return { ok: true, loaded: false, unavailableDates: [ymd], unavailableByMode: { train: [], bus: [] } };
+    }
     const toLoad = datesNeedingLoad(windowDates, modes);
     if (!toLoad.length) {
-      return { ok: true, loaded: false };
+      return { ok: true, loaded: false, unavailableDates: [], unavailableByMode: { train: [], bus: [] } };
     }
 
     const schedule = await loadHostedSchedulesForDates(
@@ -427,8 +526,78 @@ export async function ensureSchedulesForDate(ymd, options = {}) {
     );
     await appendScheduleData(schedule.trips, schedule.stopTimes);
     await finalizeStopTimeTripIndexes();
-    markLoadedKeysForDates(toLoad, modes);
-    return { ok: true, loaded: true };
+    // Per-mode unavailability: a date loads for the modes that resolved
+    // and stays unmarked for the modes that did not. The loader reports
+    // unavailableByMode; the legacy union field is the fallback when it
+    // is absent (both modes unavailable for those dates).
+    const reportedByMode = schedule?.unavailableByMode || null;
+    const unavailableByMode = {
+      train: reportedByMode?.train ? reportedByMode.train.map((d) => String(d)) : [],
+      bus: reportedByMode?.bus ? reportedByMode.bus.map((d) => String(d)) : [],
+    };
+    if (!reportedByMode) {
+      const reportedUnavailable = Array.isArray(schedule?.unavailableDates)
+        ? schedule.unavailableDates.map((d) => String(d))
+        : [];
+      if (modes.train) unavailableByMode.train = [...reportedUnavailable];
+      if (modes.bus) unavailableByMode.bus = [...reportedUnavailable];
+    }
+    // BUS ON-DEMAND FALLBACK (the one download this path is allowed to
+    // make): if bus was requested and its week is missing — background
+    // download killed, failed, or not yet run — download it BLOCKING, with
+    // the time-left message driven by the shared bus download state, then
+    // load those dates once. This runs at most once per call; a date tap
+    // still never triggers a download (the picker only offers dates
+    // within per-mode bounds, and this path is a schedule load, not a tap).
+    let busDownloadError = null;
+    if (modes.bus && unavailableByMode.bus.length) {
+      try {
+        const busResult = await ensureBusWeeksForDates(unavailableByMode.bus, options.onProgress);
+        await refreshCachedBundleMeta();
+        if (busResult?.ok) {
+          const retryDates = unavailableByMode.bus.filter((d) => toLoad.includes(d));
+          const retry = await loadHostedSchedulesForDates(
+            retryDates,
+            { train: false, bus: true },
+            activeServiceIdsForDate,
+            options.onProgress,
+          );
+          await appendScheduleData(retry.trips, retry.stopTimes);
+          await finalizeStopTimeTripIndexes();
+          const retryUnavailable = retry?.unavailableByMode?.bus
+            ? retry.unavailableByMode.bus.map((d) => String(d))
+            : (retry?.unavailableDates || []).map((d) => String(d));
+          unavailableByMode.bus = retryUnavailable;
+        } else {
+          const state = getBusDownloadState();
+          busDownloadError =
+            state?.errorMessage || busResult?.error || 'Bus schedules not downloaded — try again';
+        }
+      } catch (err) {
+        busDownloadError = err?.message || String(err) || 'Bus schedules not downloaded — try again';
+      }
+    }
+    for (const date of toLoad) {
+      if (modes.train && !unavailableByMode.train.includes(date)) {
+        loadedScheduleKeys.add(`${date}:train`);
+      }
+      if (modes.bus && !unavailableByMode.bus.includes(date)) {
+        loadedScheduleKeys.add(`${date}:bus`);
+      }
+    }
+    const unavailableDates = [...new Set([...unavailableByMode.train, ...unavailableByMode.bus])];
+    const loadedDates = toLoad.filter(
+      (d) =>
+        (modes.train && !unavailableByMode.train.includes(d)) ||
+        (modes.bus && !unavailableByMode.bus.includes(d)),
+    );
+    return {
+      ok: true,
+      loaded: loadedDates.length > 0,
+      unavailableDates,
+      unavailableByMode,
+      ...(busDownloadError ? { busDownloadError } : {}),
+    };
   };
 
   const next = scheduleLoadQueue.catch(() => {}).then(run);
@@ -961,7 +1130,22 @@ async function hydrateCoreData(data) {
   tripsById = new Map();
   stopTimesByStopId = new Map();
   stopTimesByTripId = new Map();
-  routeTypesByStopId = new Map();
+  // Publisher-side chicken-and-egg fix: seed stop classification from the
+  // core's stop_route_types table (full-feed pairs) so bus stops/pins are
+  // visible before any bus schedule slice loads. Schedule loads only ADD
+  // to this map (indexRouteTypesForBatch is add-only), so the seed and the
+  // loaded slices never disagree — a stop's set only grows. Old cores
+  // lack the table, so the seed is empty there and classification falls
+  // back to loaded trips exactly as before.
+  seededRouteTypesByStopId = new Map();
+  for (const row of data.stopRouteTypes || []) {
+    const sid = String(row.stop_id);
+    const routeType = Number(row.route_type);
+    if (!sid || Number.isNaN(routeType)) continue;
+    if (!seededRouteTypesByStopId.has(sid)) seededRouteTypesByStopId.set(sid, new Set());
+    seededRouteTypesByStopId.get(sid).add(routeType);
+  }
+  routeTypesByStopId = copyRouteTypesByStopId(seededRouteTypesByStopId);
   indexedStopTimeKeys.clear();
   pathways = data.pathways || [];
   calendarRows = data.calendar || [];
@@ -1520,7 +1704,7 @@ async function persistGtfsCacheInBackground(payload, metaBase) {
 
 async function loadFromCache(onProgress) {
   setStartupPhase('cache-load', 'Loading cached GO Transit data');
-  onProgress?.('Loading cached GO Transit data...');
+  emitProgress(onProgress, 'Loading cached GO Transit data...', undefined, STARTUP_STEP_CHECKING);
   logGtfs('cache: reading file…', { path: CACHE_FILE });
 
   const info = await FileSystem.getInfoAsync(CACHE_FILE);
@@ -1579,31 +1763,64 @@ async function loadFromCache(onProgress) {
 
 async function loadFromHostedSqlite(onProgress, options = {}) {
   setStartupPhase('sqlite-download', 'Preparing hosted schedules database');
-  emitProgress(onProgress, 'Checking schedules database...', 0.02);
+  emitProgress(onProgress, 'Checking schedules database...', 0.02, STARTUP_STEP_CHECKING);
 
   const ensureProgress = (event) => {
     if (!event) return;
     const msg = typeof event === 'string' ? event : event.message;
     const pct = typeof event === 'object' ? Number(event.percent) : NaN;
-    emitProgress(onProgress, msg || 'Downloading schedules database...', Number.isFinite(pct) ? pct : undefined);
+    // Bundle-layer messages: downloads name themselves; anything else
+    // here (version check, validation) is still the checking step.
+    const step = /downloading/i.test(String(msg || ''))
+      ? STARTUP_STEP_DOWNLOADING
+      : STARTUP_STEP_CHECKING;
+    emitProgress(
+      onProgress,
+      msg || 'Downloading schedules database...',
+      Number.isFinite(pct) ? pct : undefined,
+      step,
+    );
   };
 
-  // B0 week-gap fix: startup dates are computed before ensure so the
-  // bundle layer can download week DBs covering them. A fresh install
-  // otherwise ends startup with zero installed weeks, and the first day
-  // outside the month span loads zero trips.
+  // Startup critical path is core + the CURRENT week only: startupDates
+  // is just today (STARTUP_SCHEDULE_DAYS = 1), so the bundle layer is
+  // never asked for the next week here. Next-week prefetch happens after
+  // ready (see GtfsDataContext), never blocking startup.
   const today = torontoTodayYmd();
   const startupDates = [];
   for (let i = 0; i < STARTUP_SCHEDULE_DAYS; i += 1) {
     startupDates.push(addDaysYmd(today, i));
   }
 
+  // Coverage-expiry recovery (promoted from the error-screen retryLoad):
+  // when cached coverage already ended before today, the local-first path
+  // can only end in the zero-trips throw below, so bypass it once and go
+  // straight to a manifest-backed ensure. If that ensure fails, its
+  // reason is thrown — never a silent fallback to the expired local DBs.
+  // This runs at most once per load invocation (loadPromise dedups loads).
+  let coverageExpired = false;
+  try {
+    const freshMeta = await getBundleMeta();
+    const cachedEnd = freshMeta ? getEffectiveCoverageEnd(freshMeta) : null;
+    coverageExpired = !!(cachedEnd && cachedEnd < today);
+    if (coverageExpired) {
+      logGtfs('startup-coverage-expired', { cachedEnd, today });
+    }
+  } catch {
+    coverageExpired = false;
+  }
+
   // Local-first: use the on-device database immediately so a slow or failing
   // manifest fetch can't stall or fail startup. Version checks and downloads
   // happen in the background update flow after the app is ready.
   let ensured;
-  if (options.forceDownload) {
-    ensured = await ensureHostedSqlite({ force: true, onProgress: ensureProgress, requestedDates: startupDates });
+  if (options.forceDownload || coverageExpired) {
+    ensured = await ensureHostedSqlite({
+      force: !!options.forceDownload,
+      onProgress: ensureProgress,
+      requestedDates: startupDates,
+      modes: { train: true, bus: false },
+    });
   } else {
     const local = await ensureLocalHostedSqlite().catch(() => ({
       ok: false,
@@ -1611,7 +1828,12 @@ async function loadFromHostedSqlite(onProgress, options = {}) {
     }));
     ensured = local?.ok
       ? local
-      : await ensureHostedSqlite({ force: false, onProgress: ensureProgress, requestedDates: startupDates });
+      : await ensureHostedSqlite({
+          force: false,
+          onProgress: ensureProgress,
+          requestedDates: startupDates,
+          modes: { train: true, bus: false },
+        });
   }
 
   if (!ensured?.ok) {
@@ -1626,14 +1848,23 @@ async function loadFromHostedSqlite(onProgress, options = {}) {
     if (!event) return;
     const msg = typeof event === 'string' ? event : event.message;
     const pct = typeof event === 'object' ? Number(event.percent) : NaN;
-    emitProgress(onProgress, msg || 'Loading schedules database...', Number.isFinite(pct) ? pct : undefined);
+    emitProgress(
+      onProgress,
+      msg || 'Loading schedules database...',
+      Number.isFinite(pct) ? pct : undefined,
+      STARTUP_STEP_LOADING,
+    );
   });
 
   await hydrateCoreData(core);
   setStartupPhase('sqlite-load-startup-schedules', 'Loading startup schedules from SQLite');
-  emitProgress(onProgress, 'Loading startup schedules...', 0.55);
+  emitProgress(onProgress, 'Loading startup schedules...', 0.55, STARTUP_STEP_LOADING);
 
-  const startupModes = { train: true, bus: true };
+  // Trains-only first download: startup loads core + the train week
+  // covering today. The bus week downloads post-ready in the background
+  // (see GtfsDataContext); a bus request before it lands goes through
+  // the on-demand fallback in ensureSchedulesForDate.
+  const startupModes = { train: true, bus: false };
   const schedule = await loadHostedSchedulesForDates(
     startupDates,
     startupModes,
@@ -1642,7 +1873,12 @@ async function loadFromHostedSqlite(onProgress, options = {}) {
       if (!event) return;
       const msg = typeof event === 'string' ? event : event.message;
       const pct = typeof event === 'object' ? Number(event.percent) : NaN;
-      emitProgress(onProgress, msg || 'Loading schedules...', Number.isFinite(pct) ? pct : undefined);
+      emitProgress(
+        onProgress,
+        msg || 'Loading schedules...',
+        Number.isFinite(pct) ? pct : undefined,
+        STARTUP_STEP_LOADING,
+      );
     },
   );
 
@@ -1653,7 +1889,7 @@ async function loadFromHostedSqlite(onProgress, options = {}) {
   if (schedule.trips.length === 0) {
     logGtfs('startup-schedules-empty', { dates: startupDates });
     throw new Error(
-      `Hosted schedules unavailable for ${startupDates.join(', ')} (zero trips loaded).`,
+      `No schedules found for ${startupDates.join(', ')} (no trips for those dates).`,
     );
   }
 
@@ -1663,7 +1899,7 @@ async function loadFromHostedSqlite(onProgress, options = {}) {
 
   schedulesReadyFlag = true;
   options.onSchedulesReady?.();
-  emitProgress(onProgress, 'Schedules database ready', 0.99);
+  emitProgress(onProgress, 'Schedules database ready', 0.99, STARTUP_STEP_LOADING);
 }
 
 async function maybeRefreshGtfsCacheInBackground() {

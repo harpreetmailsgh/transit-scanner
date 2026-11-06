@@ -501,7 +501,7 @@ export async function evaluateAlertsFromFeed() {
 }
 
 /**
- * One wake tick, shared by every driver: the 60s GtfsDataContext interval,
+ * One wake tick, shared by every driver: the 30s GtfsDataContext interval,
  * the background location task, and the foreground watcher. Refreshes the
  * card from the feed, then evaluates the alert engine from the same feed.
  */

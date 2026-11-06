@@ -31,6 +31,8 @@ import {
 
 import HomeMap from '../../components/HomeMap';
 import StartupLoadingScreen from '../../components/StartupLoadingScreen';
+import WhatsNewCard from '../../components/WhatsNewCard';
+import { markWhatsNewSeen, shouldShowWhatsNew } from '../../services/whatsNewCard';
 import DepartureListRow from '../../components/DepartureListRow';
 import BusDownloadBanner from '../../components/BusDownloadBanner';
 import { useGtfsData } from '../../contexts/GtfsDataContext';
@@ -123,6 +125,29 @@ export default function HomeScreen() {
   /** Stop row chosen from a map pin (opens bottom sheet). */
   const [selectedStop, setSelectedStop] = useState(null);
   const [startupClock, setStartupClock] = useState(() => Date.now());
+
+  // One-time v1.2 what's-new card: shown once, after home is ready, to
+  // upgrading users only (see services/whatsNewCard.js). Never over the
+  // loading screen — this state is only read in the map-shell return.
+  const [whatsNewVisible, setWhatsNewVisible] = useState(false);
+  const whatsNewCheckedRef = useRef(false);
+
+  useEffect(() => {
+    if (!ready || whatsNewCheckedRef.current) return undefined;
+    whatsNewCheckedRef.current = true;
+    let cancelled = false;
+    shouldShowWhatsNew().then((show) => {
+      if (!cancelled && show) setWhatsNewVisible(true);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [ready]);
+
+  const handleWhatsNewGotIt = useCallback(async () => {
+    await markWhatsNewSeen();
+    setWhatsNewVisible(false);
+  }, []);
 
   const sheetRef = useRef(null);
   /** One ref per train trip_id so we can call animateMarkerToCoordinate. */
@@ -621,6 +646,8 @@ export default function HomeScreen() {
         </BottomSheetScrollView>
       </BottomSheetModal>
       )}
+
+      <WhatsNewCard visible={whatsNewVisible} onGotIt={handleWhatsNewGotIt} />
     </View>
   );
 }

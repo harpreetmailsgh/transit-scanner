@@ -1,0 +1,283 @@
+diff --git a/node_modules/expo-live-activity/build/index.d.ts b/node_modules/expo-live-activity/build/index.d.ts
+index 1253114..64052e5 100644
+--- a/node_modules/expo-live-activity/build/index.d.ts
++++ b/node_modules/expo-live-activity/build/index.d.ts
+@@ -3,14 +3,12 @@ type Voidable<T> = T | void;
+ export type DynamicIslandTimerType = 'circular' | 'digital';
+ type ProgressBarType = {
+     date?: number;
+-    progress?: undefined;
+-} | {
+-    date?: undefined;
+     progress?: number;
+ };
+ export type LiveActivityState = {
+     title: string;
+     subtitle?: string;
++    etaLine?: string;
+     progressBar?: ProgressBarType;
+     imageName?: string;
+     dynamicIslandImageName?: string;
+@@ -18,6 +16,7 @@ export type LiveActivityState = {
+ export type NativeLiveActivityState = {
+     title: string;
+     subtitle?: string;
++    etaLine?: string;
+     date?: number;
+     progress?: number;
+     imageName?: string;
+@@ -91,5 +90,6 @@ export declare function updateActivity(id: string, state: LiveActivityState): an
+ export declare function addActivityTokenListener(listener: (event: ActivityTokenReceivedEvent) => void): Voidable<EventSubscription>;
+ export declare function addActivityPushToStartTokenListener(listener: (event: ActivityPushToStartTokenReceivedEvent) => void): Voidable<EventSubscription>;
+ export declare function addActivityUpdatesListener(listener: (event: ActivityUpdateEvent) => void): Voidable<EventSubscription>;
++export declare function areActivitiesEnabled(): Voidable<boolean>;
+ export {};
+ //# sourceMappingURL=index.d.ts.map
+\ No newline at end of file
+diff --git a/node_modules/expo-live-activity/build/index.js b/node_modules/expo-live-activity/build/index.js
+index 4012ddc..8dfe6e0 100644
+--- a/node_modules/expo-live-activity/build/index.js
++++ b/node_modules/expo-live-activity/build/index.js
+@@ -86,4 +86,13 @@ export function addActivityUpdatesListener(listener) {
+     if (assertIOS('addActivityUpdatesListener'))
+         return ExpoLiveActivityModule.addListener('onStateChange', listener);
+ }
++/**
++ * @returns {boolean} Whether Live Activities are currently enabled for the
++ * app (false once the user has denied them; iOS will not re-prompt).
++ * Undefined on non-iOS (assertIOS) or when the native function is absent.
++ */
++export function areActivitiesEnabled() {
++    if (assertIOS('areActivitiesEnabled'))
++        return ExpoLiveActivityModule.areActivitiesEnabled();
++}
+ //# sourceMappingURL=index.js.map
+\ No newline at end of file
+diff --git a/node_modules/expo-live-activity/ios-files/LiveActivityView.swift b/node_modules/expo-live-activity/ios-files/LiveActivityView.swift
+index 1a00e92..7f218e3 100644
+--- a/node_modules/expo-live-activity/ios-files/LiveActivityView.swift
++++ b/node_modules/expo-live-activity/ios-files/LiveActivityView.swift
+@@ -43,6 +43,14 @@ import WidgetKit
+       attributes.progressViewTint.map { Color(hex: $0) }
+     }
+ 
++    /// 12-hour arrival clock time ("12:34", no am/pm) from an epoch-ms end
++    /// date, matching the JS formatEtaLine clock part. Device timezone.
++    private func etaClockText(fromMilliseconds ms: Double) -> String {
++      let formatter = DateFormatter()
++      formatter.dateFormat = "h:mm"
++      return formatter.string(from: Date(timeIntervalSince1970: ms / 1000))
++    }
++
+     private var imageAlignment: Alignment {
+       switch attributes.imageAlign {
+       case "center":
+@@ -203,17 +211,19 @@ import WidgetKit
+ 
+             if let subtitle = contentState.subtitle {
+               Text(subtitle)
+-                .font(.title3)
++                .font(.body)
++                .lineLimit(2)
++                .minimumScaleFactor(0.8)
+                 .modifier(ConditionalForegroundViewModifier(color: attributes.subtitleColor))
+             }
+ 
+             if effectiveStretch {
+-              if let date = contentState.timerEndDateInMilliseconds {
+-                ProgressView(timerInterval: Date.toTimerInterval(miliseconds: date))
++              if let progress = contentState.progress {
++                ProgressView(value: progress)
+                   .tint(progressViewTint)
+                   .modifier(ConditionalForegroundViewModifier(color: attributes.progressViewLabelColor))
+-              } else if let progress = contentState.progress {
+-                ProgressView(value: progress)
++              } else if let date = contentState.timerEndDateInMilliseconds {
++                ProgressView(timerInterval: Date.toTimerInterval(miliseconds: date))
+                   .tint(progressViewTint)
+                   .modifier(ConditionalForegroundViewModifier(color: attributes.progressViewLabelColor))
+               }
+@@ -229,12 +239,42 @@ import WidgetKit
+         }
+ 
+         if !effectiveStretch {
+-          if let date = contentState.timerEndDateInMilliseconds {
+-            ProgressView(timerInterval: Date.toTimerInterval(miliseconds: date))
++          if let etaLine = contentState.etaLine, let etaMs = contentState.timerEndDateInMilliseconds {
++            // Live ticking ETA line (locked-phone timer). The minutes part
++            // is a system-updating relative Text, NOT the baked etaLine
++            // string: etaLine only gates this branch (JS sets it nil once
++            // the ETA is past / the trip has arrived) and is the fallback
++            // below when no timer date is present. The clock suffix is
++            // formatted here from the same end date, so no new
++            // ContentState field is needed. HONEST LIMIT: Text(style:
++            // .relative) renders "44 min, 23 sec" / "1 hr, 52 min" —
++            // seconds included, "min" not "mins" — never the approved
++            // "45 mins" wording. That wording difference is an open
++            // decision for Harpreet; this is the closest native option.
++            HStack(spacing: 0) {
++              Spacer()
++              Text(Date(timeIntervalSince1970: etaMs / 1000), style: .relative)
++                .font(.caption)
++                .modifier(ConditionalForegroundViewModifier(color: attributes.subtitleColor))
++              Text(" to arrival - \(etaClockText(fromMilliseconds: etaMs))")
++                .font(.caption)
++                .modifier(ConditionalForegroundViewModifier(color: attributes.subtitleColor))
++            }
++          } else if let etaLine = contentState.etaLine {
++            HStack {
++              Spacer()
++              Text(etaLine)
++                .font(.caption)
++                .modifier(ConditionalForegroundViewModifier(color: attributes.subtitleColor))
++            }
++          }
++
++          if let progress = contentState.progress {
++            ProgressView(value: progress)
+               .tint(progressViewTint)
+               .modifier(ConditionalForegroundViewModifier(color: attributes.progressViewLabelColor))
+-          } else if let progress = contentState.progress {
+-            ProgressView(value: progress)
++          } else if let date = contentState.timerEndDateInMilliseconds {
++            ProgressView(timerInterval: Date.toTimerInterval(miliseconds: date))
+               .tint(progressViewTint)
+               .modifier(ConditionalForegroundViewModifier(color: attributes.progressViewLabelColor))
+           }
+diff --git a/node_modules/expo-live-activity/ios-files/LiveActivityWidget.swift b/node_modules/expo-live-activity/ios-files/LiveActivityWidget.swift
+index 24cd8c5..c8d00c0 100644
+--- a/node_modules/expo-live-activity/ios-files/LiveActivityWidget.swift
++++ b/node_modules/expo-live-activity/ios-files/LiveActivityWidget.swift
+@@ -6,6 +6,7 @@ struct LiveActivityAttributes: ActivityAttributes {
+   struct ContentState: Codable, Hashable {
+     var title: String
+     var subtitle: String?
++    var etaLine: String?
+     var timerEndDateInMilliseconds: Double?
+     var progress: Double?
+     var imageName: String?
+diff --git a/node_modules/expo-live-activity/ios/ExpoLiveActivityModule.swift b/node_modules/expo-live-activity/ios/ExpoLiveActivityModule.swift
+index 6fdf9f5..ed2d03b 100644
+--- a/node_modules/expo-live-activity/ios/ExpoLiveActivityModule.swift
++++ b/node_modules/expo-live-activity/ios/ExpoLiveActivityModule.swift
+@@ -9,6 +9,11 @@ public class ExpoLiveActivityModule: Module {
+     @Field
+     var subtitle: String?
+ 
++    // Transit Scanner ETA line (e.g. "5 mins to arrival - 12:34"), rendered
++    // as a small right-aligned line above the progress bar. Nil = no line.
++    @Field
++    var etaLine: String?
++
+     @Field
+     var progressBar: ProgressBar?
+ 
+@@ -248,6 +253,7 @@ public class ExpoLiveActivityModule: Module {
+         let initialState = LiveActivityAttributes.ContentState(
+           title: state.title,
+           subtitle: state.subtitle,
++          etaLine: state.etaLine,
+           timerEndDateInMilliseconds: state.progressBar?.date,
+           progress: state.progressBar?.progress
+         )
+@@ -270,6 +276,17 @@ public class ExpoLiveActivityModule: Module {
+       }
+     }
+ 
++    Function("areActivitiesEnabled") {
++      () -> Bool in
++      // iOS 16.1+ API; the pod targets 15.1, so guard it. Returns false
++      // once the user has denied Live Activities (and on re-tap iOS will
++      // not re-prompt), true while allowed or not yet determined.
++      if #available(iOS 16.1, *) {
++        return ActivityAuthorizationInfo().areActivitiesEnabled
++      }
++      return false
++    }
++
+     Function("stopActivity") { (activityId: String, state: LiveActivityState) in
+       guard #available(iOS 16.2, *) else { throw UnsupportedOSException("16.2") }
+ 
+@@ -284,6 +301,7 @@ public class ExpoLiveActivityModule: Module {
+         var newState = LiveActivityAttributes.ContentState(
+           title: state.title,
+           subtitle: state.subtitle,
++          etaLine: state.etaLine,
+           timerEndDateInMilliseconds: state.progressBar?.date,
+           progress: state.progressBar?.progress
+         )
+@@ -311,6 +329,7 @@ public class ExpoLiveActivityModule: Module {
+         var newState = LiveActivityAttributes.ContentState(
+           title: state.title,
+           subtitle: state.subtitle,
++          etaLine: state.etaLine,
+           timerEndDateInMilliseconds: state.progressBar?.date,
+           progress: state.progressBar?.progress
+         )
+diff --git a/node_modules/expo-live-activity/ios/LiveActivityAttributes.swift b/node_modules/expo-live-activity/ios/LiveActivityAttributes.swift
+index f71c857..29d1bd7 100644
+--- a/node_modules/expo-live-activity/ios/LiveActivityAttributes.swift
++++ b/node_modules/expo-live-activity/ios/LiveActivityAttributes.swift
+@@ -5,6 +5,7 @@ struct LiveActivityAttributes: ActivityAttributes {
+   struct ContentState: Codable, Hashable {
+     var title: String
+     var subtitle: String?
++    var etaLine: String?
+     var timerEndDateInMilliseconds: Double?
+     var progress: Double?
+     var imageName: String?
+diff --git a/node_modules/expo-live-activity/src/index.ts b/node_modules/expo-live-activity/src/index.ts
+index 675bc9e..f81cbc0 100644
+--- a/node_modules/expo-live-activity/src/index.ts
++++ b/node_modules/expo-live-activity/src/index.ts
+@@ -7,19 +7,20 @@ type Voidable<T> = T | void
+ 
+ export type DynamicIslandTimerType = 'circular' | 'digital'
+ 
+-type ProgressBarType =
+-  | {
+-      date?: number
+-      progress?: undefined
+-    }
+-  | {
+-      date?: undefined
+-      progress?: number
+-    }
++// date and progress may now be set together: date drives the Dynamic
++// Island countdown while progress keeps the Lock Screen progress bar.
++// Previously the union forced exactly one of the two.
++type ProgressBarType = {
++  date?: number
++  progress?: number
++}
+ 
+ export type LiveActivityState = {
+   title: string
+   subtitle?: string
++  // Small right-aligned ETA line above the progress bar, e.g.
++  // "5 mins to arrival - 12:34". Absent = no line.
++  etaLine?: string
+   progressBar?: ProgressBarType
+   imageName?: string
+   dynamicIslandImageName?: string
+@@ -28,6 +29,7 @@ export type LiveActivityState = {
+ export type NativeLiveActivityState = {
+   title: string
+   subtitle?: string
++  etaLine?: string
+   date?: number
+   progress?: number
+   imageName?: string
+@@ -199,3 +201,12 @@ export function addActivityUpdatesListener(
+ ): Voidable<EventSubscription> {
+   if (assertIOS('addActivityUpdatesListener')) return ExpoLiveActivityModule.addListener('onStateChange', listener)
+ }
++
++/**
++ * Whether Live Activities are currently enabled for the app: false once
++ * the user has denied them (iOS will not re-prompt), true while allowed
++ * or not yet determined.
++ */
++export function areActivitiesEnabled(): Voidable<boolean> {
++  if (assertIOS('areActivitiesEnabled')) return ExpoLiveActivityModule.areActivitiesEnabled()
++}

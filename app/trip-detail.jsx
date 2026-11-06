@@ -38,12 +38,15 @@ import {
   removeSavedTrip,
   saveTrip,
 } from '../services/savedTripsService';
-import { startForTrip, stopTracking, getActiveLiveSession } from '../services/liveActivityService';
+import { startForTrip, stopTracking, getActiveLiveSession, subscribeToLaDismissal, isLaEnabled } from '../services/liveActivityService';
 import {
   startAlertsForTrip,
   stopAlerts,
   getRideAlertStatus,
   retryAlertPermissions,
+  runLocationGate,
+  getLocationPermissionStatuses,
+  recheckAlertPermissions,
 } from '../services/rideTrackingService';
 
 const GO_GREEN = '#00853F';
@@ -303,6 +306,12 @@ export default function TripDetailScreen() {
   const [saved, setSaved] = useState(false);
   const [tracking, setTracking] = useState(false);
   const [trackBusy, setTrackBusy] = useState(false);
+  // The stop this trip is currently tracked TO ('' = the trip's final stop,
+  // the old top-button target). Set alongside `tracking` below.
+  const [trackedStopId, setTrackedStopId] = useState('');
+  // The stop whose Track button is mid-flight (spinner); all Track buttons
+  // are disabled while any tracking op runs.
+  const [pendingStopId, setPendingStopId] = useState(null);
   // Get-off alert status for THIS trip (from getRideAlertStatus — the strip's
   // only data source); null when this trip has no alert session.
   const [alertStatus, setAlertStatus] = useState(null);
@@ -442,6 +451,8 @@ export default function TripDetailScreen() {
 
     const isThisTrip = (s) => !!(s && tripId && String(s.tripId) === String(tripId));
     setTracking(isThisTrip(live) || isThisTrip(ride));
+    const thisSession = (isThisTrip(live) ? live : null) || (isThisTrip(ride) ? ride : null);
+    setTrackedStopId(thisSession ? String(thisSession.toStopId || '') : '');
     setAlertStatus(isThisTrip(ride) ? ride : null);
 
     const other = [live, ride].find((s) => s && !isThisTrip(s)) || null;
@@ -477,8 +488,9 @@ export default function TripDetailScreen() {
 
   // UI-7: re-derive on screen focus. On Android this is also the Directive F
   // return path: if the user granted "Always" location in system Settings
-  // while a session sits in `limited`, pick the grant up via
-  // retryAlertPermissions (starts the background drivers) before re-deriving.
+  // while a session sits in `limited`, pick the grant up via the GET-ONLY
+  // recheckAlertPermissions (starts the background drivers on an upgrade,
+  // never prompts, never downgrades) before re-deriving.
   useFocusEffect(
     useCallback(() => {
       let cancelled = false;
@@ -493,10 +505,31 @@ export default function TripDetailScreen() {
               status.alertState === 'limited' &&
               !status.backgroundEnabled
             ) {
-              await retryAlertPermissions();
+              await recheckAlertPermissions();
             }
           } catch {
             // Best-effort pickup; the re-derive below still runs.
+          }
+        }
+        // iOS dismissal cleanup (foreground check): under stop-everything,
+        // a ride session without a card is never a legitimate resting
+        // state on iOS — it means the card was dismissed while this screen
+        // was not mounted (the module listener already cleared the live
+        // session, but alerts are a separate session). Stop the alerts so
+        // the button cannot stay green and the strip cannot linger; the
+        // re-derive below then renders Default / absent. A live card for
+        // this trip short-circuits this entirely.
+        if (Platform.OS === 'ios' && tripId && !cancelled) {
+          try {
+            const ride = await getRideAlertStatus();
+            const live = await getActiveLiveSession();
+            const rideThis = ride && String(ride.tripId) === String(tripId);
+            const liveThis = live && String(live.tripId) === String(tripId);
+            if (rideThis && !liveThis) {
+              await stopAlerts('stopped');
+            }
+          } catch {
+            // Best-effort cleanup; the re-derive below still runs.
           }
         }
         if (!cancelled) {
@@ -508,6 +541,39 @@ export default function TripDetailScreen() {
       };
     }, [tripId, refreshTrackingState]),
   );
+
+  // iOS: when our Live Activity is dismissed (user swiped the card away, or
+  // iOS ended it), the service has already cleared the live session; this
+  // stops the alerts too (stop-everything) and re-derives, so the button
+  // returns to Default and the strip goes absent instead of claiming
+  // tracked indefinitely. The service-level listener itself outlives this
+  // screen; the focus cleanup above covers dismissals that happened while
+  // this screen was not mounted.
+  useEffect(() => {
+    if (Platform.OS !== 'ios') return undefined;
+    let sub = null;
+    try {
+      sub = subscribeToLaDismissal(() => {
+        (async () => {
+          try {
+            await stopAlerts('stopped');
+          } catch {
+            // stopAlerts never throws by contract; stay defensive anyway.
+          }
+          refreshTrackingState();
+        })();
+      });
+    } catch {
+      sub = null;
+    }
+    return () => {
+      try {
+        sub?.remove?.();
+      } catch {
+        // best effort
+      }
+    };
+  }, [refreshTrackingState]);
 
   useEffect(() => {
     let mounted = true;
@@ -623,13 +689,69 @@ export default function TripDetailScreen() {
     }
   }, []);
 
-  const handleTrackTrip = useCallback(async () => {
-    if (!tripId || trackBusy) return;
+  // LA-denial message: replaces the generic 'Couldn't start tracking'
+  // for the denial case only. The card cannot show without the
+  // permission; Settings is where the Live Activities toggle lives, and a
+  // later Track tap retries the card (no auto-restart).
+  const showLaDeniedMessage = useCallback(() => {
+    Alert.alert(
+      'Live Activities are off',
+      'Turn on Live Activities in Settings to track this trip on your Lock Screen.',
+      [
+        { text: 'Not now', style: 'cancel' },
+        {
+          text: 'Open Settings',
+          onPress: () => {
+            Linking.openSettings().catch(() => {});
+          },
+        },
+      ],
+    );
+  }, []);
+  // Pre-permission explainer (Harpreet's spec, 2026-11-02): on a Track tap
+  // the gate shows this whenever location is NOT already Always-on,
+  // regardless of notification or foreground state; it is skipped only
+  // when Always is already granted. Wording names the exact option on each
+  // OS's screen. Continue → the OS prompt runs (or Settings opens when
+  // background is permanently denied); Not now → NO OS box at all, and the
+  // tap aborts before any card or session exists (the rollback block below
+  // stays only as a safety net for denial outcomes that reach arming).
+  const showBackgroundExplainer = useCallback(
+    () =>
+      new Promise((resolve) => {
+        const message =
+          Platform.OS === 'android'
+            ? 'Select Allow all the time on the next screen to alert you before your stop.'
+            : 'Select Always Allow on the next screen to alert you before your stop.';
+        Alert.alert('Location access needed', message, [
+          { text: 'Not now', style: 'cancel', onPress: () => resolve(false) },
+          { text: 'Continue', onPress: () => resolve(true) },
+        ], { cancelable: false });
+      }),
+    [],
+  );
 
-    if (tracking) {
+  // Per-stop tracking: every upcoming stop row carries its own Track button.
+  // Tapping a stop tracks TO that stop (the get-off alert fires 1 stop
+  // before it); tapping the tracked stop stops tracking; tapping another
+  // stop replaces the session — the services already enforce a single
+  // session (startForTrip ends the current activity as 'replaced',
+  // startAlertsForTrip ends the existing alert session first), so the
+  // replacement the UI promises is the replacement the services perform.
+  const handleTrackStop = useCallback(async (stop) => {
+    if (!tripId || trackBusy || !stop?.stop_id) return;
+    const stopId = String(stop.stop_id);
+    const lastStopId =
+      Array.isArray(stops) && stops.length ? String(stops[stops.length - 1].stop_id) : '';
+    // An empty session value means the trip's final stop (the old
+    // top-button target); no session means nothing is tracked.
+    const effectiveTrackedId = tracking ? trackedStopId || lastStopId : '';
+
+    if (effectiveTrackedId && effectiveTrackedId === stopId) {
       // Orchestration step 4: one stop tap ends BOTH the card and the alert
       // session, then state is re-derived rather than assumed.
       setTrackBusy(true);
+      setPendingStopId(stopId);
       try {
         await stopTracking();
       } catch {
@@ -642,22 +764,51 @@ export default function TripDetailScreen() {
       }
       await refreshTrackingState();
       setTrackBusy(false);
+      setPendingStopId(null);
       return;
     }
 
     setTrackBusy(true);
+    setPendingStopId(stopId);
     try {
-      // Orchestration step 1: the card starts first — it is never delayed by
-      // any permission prompt (alert arming happens after, and its outcomes
-      // land in the strip as states, never as modals).
+      // Orchestration step 1: the LOCATION GATE runs first, before anything
+      // is started or replaced. Already Always-on → no explainer, no
+      // prompt, straight through. Otherwise the explainer runs (regardless
+      // of notification/foreground state). Not now, or a foreground denial
+      // in its own prompt → abort here: no OS Always box, no Settings, no
+      // card, no alert session, button stays Default, no strip. Continue
+      // with background permanently denied → Settings opens and the tap
+      // aborts; the grant is picked up on return by the next tap's get-only
+      // check (or, for an existing limited session, the focus recheck).
+      // The gate outcome is pre-resolved for arming below, so the
+      // explainer and location prompts never re-fire for this tap.
+      let locationGate = null;
+      try {
+        locationGate = await runLocationGate(showBackgroundExplainer);
+      } catch {
+        locationGate = { outcome: 'aborted', explainerShown: false };
+      }
+      if (!locationGate || locationGate.outcome === 'aborted') {
+        return;
+      }
+      if (locationGate.outcome === 'needs-settings') {
+        try {
+          await Linking.openSettings();
+        } catch {
+          // Nothing sensible to fall back to; the user can tap again.
+        }
+        return;
+      }
+      // Orchestration step 2: only now does the card start. (Notifications
+      // are checked last, inside arming, after the gate.)
       let result = null;
       try {
         result = await startForTrip({
           tripId,
           fromStopId,
-          toStopId: toStopId || '',
+          toStopId: stopId,
           lineName: lineName || '',
-          destinationName: summary.toName,
+          destinationName: stop.stop_name,
           departureLabel: summary.departure,
           departureTime: departureTime ? String(departureTime) : undefined,
           scheduledDateTime: scheduledDateTime || undefined,
@@ -667,50 +818,116 @@ export default function TripDetailScreen() {
       }
 
       const cardStarted = !!(result && result.started !== false);
+      // Orchestration step 3 (iOS): Directive E outcome — EXCEPT a Live
+      // Activities denial, which stops EVERYTHING (final decision). A
+      // denial is a failed start ('start-failed'/'error') PLUS the patched
+      // native query reporting activities disabled (iOS does not re-prompt
+      // on re-tap, so a denied re-tap fails the same way). On denial: no
+      // alerts are armed, and any alert session is stopped too — the
+      // failed start already replaced the old card, so stopping alerts as
+      // well is what makes "nothing running" true (button Default, strip
+      // absent). The LA-specific message replaces the generic failure for
+      // this case only. Any other failure reason, or an unavailable query
+      // (null), keeps the old generic outcome and arms nothing.
+      let armAlerts = cardStarted || Platform.OS === 'android';
       if (!cardStarted && Platform.OS !== 'android') {
-        // Orchestration step 2 (iOS): Directive E outcome; do NOT arm alerts.
-        showCardFailure(result.reason);
-      } else {
-        // Orchestration step 3: iOS card started, or Android (unsupported-
-        // platform — no message, ever) → arm the get-off alerts. Show the
+        const laDenied =
+          (result?.reason === 'start-failed' || result?.reason === 'error') &&
+          (await isLaEnabled()) === false;
+        if (laDenied) {
+          try {
+            await stopAlerts('stopped');
+          } catch {
+            // stopAlerts never throws by contract; stay defensive anyway.
+          }
+          showLaDeniedMessage();
+          armAlerts = false;
+        } else {
+          showCardFailure(result.reason);
+        }
+      }
+      if (armAlerts) {
+        // Orchestration step 4: iOS card started, or Android (unsupported-
+        // platform — no message, ever) → arm the get-off alerts on the
+        // pre-resolved gate outcome (no location prompt re-fires here;
+        // notifications are checked last inside arming). Show the
         // transient 'setting-up' state while arming resolves.
         setAlertStatus({
           tripId,
           alertState: 'setting-up',
           backgroundEnabled: false,
           staleFeed: false,
-          destinationName: summary.toName,
+          destinationName: stop.stop_name,
           departureLabel: summary.departure,
         });
+        let alertsRes = null;
         try {
-          await startAlertsForTrip({
+          alertsRes = await startAlertsForTrip({
             tripId,
             fromStopId,
-            toStopId: toStopId || '',
+            toStopId: stopId,
             lineName: lineName || '',
-            destinationName: summary.toName,
+            destinationName: stop.stop_name,
             departureLabel: summary.departure,
+            preResolvedGate: locationGate,
+            onBeforeBackgroundRequest: showBackgroundExplainer,
           });
         } catch {
           // startAlertsForTrip never throws by contract; the re-derive below
           // renders whatever session state actually persisted.
         }
+        // Fresh-tap denial rollback (safety net — the gate above already
+        // aborts explainer-Not-now and foreground-denial taps before the
+        // card starts): NO denial outcome may leave the button green. An
+        // armed 'off' session (notifications denied — checked last, after
+        // the gate) or a denial-'limited' session (Always denied in the OS
+        // prompt) rolls back BOTH the just-started card and the
+        // just-written alert session, so the button returns to Default and
+        // no strip renders. Capability-
+        // 'limited' (background unavailable on this device/build) is NOT
+        // a denial and is preserved, as is any unarmed result (a data
+        // failure, not a permission outcome — the old card-only state
+        // stands). This also covers a replacement tap: the services have
+        // already replaced the old session before the outcome is known,
+        // so a denied replacement lands at Default rather than restoring
+        // the previous session (no snapshot-restore is in scope).
+        if (
+          alertsRes &&
+          alertsRes.armed &&
+          !alertsRes.backgroundCapabilityUnavailable &&
+          (alertsRes.alertState === 'off' || alertsRes.alertState === 'limited')
+        ) {
+          try {
+            await stopTracking();
+          } catch {
+            // best effort
+          }
+          try {
+            await stopAlerts('stopped');
+          } catch {
+            // stopAlerts never throws by contract; stay defensive anyway.
+          }
+        }
       }
       await refreshTrackingState();
     } finally {
       setTrackBusy(false);
+      setPendingStopId(null);
     }
   }, [
     tripId,
     fromStopId,
-    toStopId,
     lineName,
     departureTime,
     scheduledDateTime,
     summary,
+    stops,
     tracking,
+    trackedStopId,
     trackBusy,
     showCardFailure,
+    showLaDeniedMessage,
+    showBackgroundExplainer,
     refreshTrackingState,
   ]);
 
@@ -720,40 +937,89 @@ export default function TripDetailScreen() {
     const state = alertStatus.alertState;
     if (state !== 'limited' && state !== 'off') return;
 
-    // Directive F (Android `limited`): Android 11+ offers no in-app popup for
-    // "Always" location — the tap opens the app's system Settings page; the
-    // grant is picked up on return (focus re-derive). Android ≤ 10 still
-    // allows the in-app request, which retryAlertPermissions runs.
+    // Directive F (Android `limited`, Android 11+): no in-app popup for
+    // "Always" location exists, so this branch goes through the explainer
+    // first — Continue opens Settings, Not now opens nothing — instead of
+    // opening Settings directly. The grant is picked up on return (the
+    // get-only focus recheck). Exception: if background is already granted
+    // (get-only read), fall through to the normal gated retry below, which
+    // upgrades without an explainer. Android ≤ 10 still allows the in-app
+    // request, which the gated retry runs.
     if (
       Platform.OS === 'android' &&
       state === 'limited' &&
       Number(Platform.Version) >= 30
     ) {
+      let backgroundGranted = false;
+      try {
+        const statuses = await getLocationPermissionStatuses();
+        backgroundGranted = statuses.background === 'granted';
+      } catch {
+        backgroundGranted = false;
+      }
+      if (!backgroundGranted) {
+        let proceed = false;
+        try {
+          proceed = await showBackgroundExplainer();
+        } catch {
+          proceed = false;
+        }
+        if (proceed) {
+          try {
+            await Linking.openSettings();
+          } catch {
+            // Nothing sensible to fall back to; the ask stays on the strip.
+          }
+        }
+        return;
+      }
+    }
+
+    // Strip retry, identical gate to a Track tap: explainer first
+    // (whenever background is not already granted), abort leaves the
+    // session untouched, needs-settings opens Settings and leaves the
+    // session untouched, and only a passed gate reaches the retry — which
+    // reuses the pre-resolved outcome, so no prompt re-fires.
+    let locationGate = null;
+    try {
+      locationGate = await runLocationGate(showBackgroundExplainer);
+    } catch {
+      locationGate = { outcome: 'aborted', explainerShown: false };
+    }
+    if (!locationGate || locationGate.outcome === 'aborted') {
+      return;
+    }
+    if (locationGate.outcome === 'needs-settings') {
       try {
         await Linking.openSettings();
       } catch {
-        // Nothing sensible to fall back to; the ask stays on the strip.
+        // Leave the strip as-is; the user can tap again.
       }
       return;
     }
 
     let nextState = null;
     try {
-      const res = await retryAlertPermissions();
+      const res = await retryAlertPermissions({
+        preResolvedGate: locationGate,
+        onBeforeBackgroundRequest: showBackgroundExplainer,
+      });
       nextState = res?.alertState || null;
     } catch {
       nextState = null;
     }
     await refreshTrackingState();
-    // Still stuck after the in-app retry (permanently denied) → Settings.
-    if (nextState && nextState === state) {
+    // Still stuck after the in-app retry (permanently denied) → Settings,
+    // but ONLY when the explainer actually ran for this tap (a granted-gate
+    // retry that stays stuck must not auto-open Settings).
+    if (nextState && nextState === state && locationGate.explainerShown) {
       try {
         await Linking.openSettings();
       } catch {
         // Leave the strip as-is; the user can tap again.
       }
     }
-  }, [alertStatus, trackBusy, refreshTrackingState]);
+  }, [alertStatus, trackBusy, showBackgroundExplainer, refreshTrackingState]);
 
   const handleSaveTrip = useCallback(async () => {
     if (!tripId || !fromStopId || isSaving) return;
@@ -876,6 +1142,13 @@ export default function TripDetailScreen() {
     const StopTimeText = isNext ? Animated.Text : Text;
     const PlatformText = isNext ? Animated.Text : Text;
     const StopNumberCircle = isNext ? Animated.View : View;
+    // Per-stop Track: every stop after boarding that hasn't passed yet.
+    // The boarding stop itself (isFrom) is never a destination.
+    const isTrackedStop =
+      tracking &&
+      (trackedStopId ||
+        (stops?.length ? String(stops[stops.length - 1].stop_id) : '')) === String(item.stop_id);
+    const showTrack = !item.isFrom && !(upcomingStopIndex >= 0 && index < upcomingStopIndex);
     const stopNumberCircleStyle = [
       styles.stopNumberCircle,
       isPast ? styles.stopNumberCirclePast : null,
@@ -907,9 +1180,29 @@ export default function TripDetailScreen() {
                 {item.stop_name}
               </StopNameText>
             </View>
-            <StopTimeText style={timeStyle} numberOfLines={1}>{timeLabel}</StopTimeText>
           </View>
-          {rowPlatformCode ? <PlatformText style={platformStyle}>{`Platform ${rowPlatformCode}`}</PlatformText> : null}
+          <View style={styles.stopBottomRow}>
+            <View style={styles.stopMetaWrap}>
+              <StopTimeText style={timeStyle} numberOfLines={1}>{timeLabel}</StopTimeText>
+              {rowPlatformCode ? (
+                <PlatformText style={platformStyle}>{`Platform ${rowPlatformCode}`}</PlatformText>
+              ) : null}
+            </View>
+            {showTrack ? (
+              <TouchableOpacity
+                style={[styles.stopTrackBtn, isTrackedStop && styles.stopTrackBtnActive]}
+                onPress={() => handleTrackStop(item)}
+                disabled={trackBusy}
+                activeOpacity={0.8}
+              >
+                {pendingStopId === String(item.stop_id) ? (
+                  <ActivityIndicator size="small" color={isTrackedStop ? '#fff' : '#D22F27'} />
+                ) : (
+                  <Text style={[styles.stopTrackText, isTrackedStop && styles.stopTrackTextActive]}>{isTrackedStop ? 'Tracking' : 'Track'}</Text>
+                )}
+              </TouchableOpacity>
+            ) : null}
+          </View>
         </View>
       </View>
     );
@@ -921,6 +1214,11 @@ export default function TripDetailScreen() {
     stops,
     upcomingStopIndex,
     upcomingBlinkColor,
+    tracking,
+    trackedStopId,
+    pendingStopId,
+    trackBusy,
+    handleTrackStop,
   ]);
 
   const liveStatusLabel = useMemo(() => {
@@ -939,7 +1237,7 @@ export default function TripDetailScreen() {
         line = '🔔 Get-off alert: setting up…';
         break;
       case 'on':
-        line = '🔔 Get-off alert on — buzzes 1 stop before';
+        line = `🔔 Get-off alert on — buzzes 1 stop before ${destination}`;
         break;
       case 'limited':
         // Android `limited` is the Directive F ask; iOS keeps the fix copy.
@@ -993,26 +1291,6 @@ export default function TripDetailScreen() {
         </TouchableOpacity>
 
         <View style={styles.rightActions}>
-          {tripId ? (
-            <TouchableOpacity
-              style={[styles.trackBtn, tracking && styles.trackBtnActive]}
-              onPress={handleTrackTrip}
-              disabled={trackBusy}
-              activeOpacity={0.8}
-            >
-              {trackBusy ? (
-                <ActivityIndicator size="small" color="#fff" />
-              ) : (
-                <>
-                  <MaterialIcons name={tracking ? 'stop' : 'my-location'} size={20} color="#fff" />
-                  <Text style={styles.trackText}>
-                    {tracking ? 'Tracking ✓ — tap to stop' : 'Buzz me before my stop'}
-                  </Text>
-                </>
-              )}
-            </TouchableOpacity>
-          ) : null}
-
           <TouchableOpacity style={styles.saveBtn} onPress={handleSaveTrip} disabled={isSaving} activeOpacity={0.8}>
             {isSaving ? (
               <ActivityIndicator size="small" color={GO_GREEN} />
@@ -1090,9 +1368,15 @@ const styles = StyleSheet.create({
   topTint: { position: 'absolute', top: 0, left: 0, right: 0, height: 160, backgroundColor: '#eef8f2' },
   topActionsRow: { marginTop: 4, marginLeft: 12, marginRight: 12, marginBottom: 8, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   rightActions: { flexDirection: 'row', alignItems: 'center', gap: 8 },
-  trackBtn: { minWidth: 82, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 5, paddingHorizontal: 12, paddingVertical: 8, borderRadius: 999, backgroundColor: GO_GREEN, elevation: 3, shadowColor: '#000', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.12, shadowRadius: 4 },
-  trackBtnActive: { backgroundColor: '#B91C1C' },
-  trackText: { fontSize: 14, color: '#fff', fontWeight: '600' },
+  // Button states (decided): Default 'Track' = light grey bg + red font;
+  // Tracking = GO_GREEN bg + white font, text 'Tracking' (no checkmark).
+  // Spinner follows its button: red on Default, white on Tracking.
+  stopTrackBtn: { minWidth: 64, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 12, paddingVertical: 6, borderRadius: 999, backgroundColor: '#E5E7EB' },
+  stopTrackBtnActive: { backgroundColor: GO_GREEN },
+  stopTrackText: { fontSize: 13, color: '#D22F27', fontWeight: '700' },
+  stopTrackTextActive: { color: '#fff' },
+  stopBottomRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginTop: 2 },
+  stopMetaWrap: { flexDirection: 'column', flex: 1, paddingRight: 8 },
   liveStatusBar: {
     marginHorizontal: 12,
     marginBottom: 10,
@@ -1181,7 +1465,7 @@ const styles = StyleSheet.create({
   connectorPast: { backgroundColor: '#cfd5dd' },
   stopContent: { flex: 1, paddingVertical: 10 },
   stopMainRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 8 },
-  stopTitleWrap: { flexDirection: 'row', alignItems: 'center', gap: 8, maxWidth: '60%' },
+  stopTitleWrap: { flexDirection: 'row', alignItems: 'center', gap: 8, flex: 1 },
   stopNameEndpoint: { fontSize: 15, fontWeight: '800', color: '#1f2937' },
   stopNameIntermediate: { fontSize: 15, fontWeight: '700', color: '#374151' },
   stopNamePast: { color: '#9ca3af' },

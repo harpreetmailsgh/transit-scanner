@@ -49,6 +49,31 @@ let vehicleSnapshots = [];
 /** @type {number|null} last successful realtime refresh timestamp (ms epoch) */
 let realtimeLastUpdatedMs = null;
 
+/** @type {number|null} last refresh attempt start timestamp (ms epoch) */
+let realtimeLastAttemptMs = null;
+
+/** @type {string|null} most recent feed failure message (cleared by a fully successful refresh) */
+let realtimeLastError = null;
+
+/** @type {number} consecutive fully-failed refresh attempts (reset on any success) */
+let realtimeConsecutiveFailures = 0;
+
+/** @type {Promise<void>|null} in-flight refresh, shared by overlapping callers */
+let refreshInFlight = null;
+
+/** @type {Set<Function>} diagnostics subscribers, notified once per settled refresh */
+const diagnosticsListeners = new Set();
+
+function notifyDiagnosticsListeners() {
+  for (const listener of [...diagnosticsListeners]) {
+    try {
+      listener();
+    } catch {
+      // A broken subscriber must never break the poll loop.
+    }
+  }
+}
+
 let pollTimer = null;
 let pollGeneration = 0;
 
@@ -79,9 +104,16 @@ function readTranslatedField(field) {
 // ---------------------------------------------------------------------------
 
 function ingestTripUpdates(feed) {
-  stopDelaySeconds.clear();
-  tripFallbackDelay.clear();
-  realtimePlatforms.clear();
+  // Build into temporary maps first and only swap them in once the whole
+  // feed has been read without an error. Clearing the live maps first
+  // would wipe the last good data if a later entry in the same feed
+  // turned out to be malformed — a failed feed must leave prior data
+  // untouched, exactly like a failed fetch. (A successful feed with zero
+  // entries still swaps in empty maps: no live trips is real information,
+  // not a failure.)
+  const nextStopDelays = new Map();
+  const nextFallbackDelays = new Map();
+  const nextPlatforms = new Map();
   const entities = feed.entity || [];
   for (const ent of entities) {
     // Protobuf JS uses camelCase (tripUpdate, tripId, stopTimeUpdate, …)
@@ -112,20 +144,27 @@ function ingestTripUpdates(feed) {
       if (stu.stopId) {
         const stopId = String(stu.stopId);
         if (stopDelaySec !== null) {
-          stopDelaySeconds.set(`${tripId}:${stopId}`, Number(stopDelaySec));
+          nextStopDelays.set(`${tripId}:${stopId}`, Number(stopDelaySec));
         }
       }
       // Extract platform_code — GTFS-RT spec allows it on StopTimeUpdate
       const pc = stu.platformCode || stu.platform_code;
       if (pc && String(pc).trim() && stu.stopId) {
-        realtimePlatforms.set(`${tripId}:${String(stu.stopId)}`, String(pc).trim());
+        nextPlatforms.set(`${tripId}:${String(stu.stopId)}`, String(pc).trim());
       }
     }
 
     if (fallbackDelaySec !== null) {
-      tripFallbackDelay.set(tripId, fallbackDelaySec);
+      nextFallbackDelays.set(tripId, fallbackDelaySec);
     }
   }
+  // Whole feed read cleanly — only now replace the live data.
+  stopDelaySeconds.clear();
+  tripFallbackDelay.clear();
+  realtimePlatforms.clear();
+  for (const [key, value] of nextStopDelays) stopDelaySeconds.set(key, value);
+  for (const [key, value] of nextFallbackDelays) tripFallbackDelay.set(key, value);
+  for (const [key, value] of nextPlatforms) realtimePlatforms.set(key, value);
 }
 
 function ingestVehiclePositions(feed) {
@@ -156,40 +195,119 @@ function ingestVehiclePositions(feed) {
 // Network fetch
 // ---------------------------------------------------------------------------
 
+/**
+ * A hung feed must never outlive the 30s poll interval: with no timeout a
+ * dead fetch stalls every later poll behind it (and, before the in-flight
+ * guard below, overlapping runs raced last-writer-wins). 20s leaves room
+ * for a slow cellular fetch while guaranteeing each poll cycle settles
+ * inside its interval. The AbortController is best-effort — if the runtime
+ * ignores the signal, the timeout race below still rejects locally and
+ * the attempt's late result is discarded by the in-flight guard, so
+ * correctness never depends on the abort actually cancelling the fetch.
+ */
+const REALTIME_FETCH_TIMEOUT_MS = 20000;
+
 async function fetchProtobuf(url) {
-  const res = await fetch(url);
-  if (!res.ok) {
-    throw new Error(`GTFS-RT ${url} failed: HTTP ${res.status}`);
+  const controller =
+    typeof AbortController !== 'undefined' ? new AbortController() : null;
+  let timeoutId = null;
+  try {
+    const timeoutPromise = new Promise((_, reject) => {
+      timeoutId = setTimeout(() => {
+        try {
+          controller?.abort();
+        } catch {
+          // Abort is best-effort; the timeout rejection below is what matters.
+        }
+        reject(
+          new Error(
+            `GTFS-RT ${url} timed out after ${REALTIME_FETCH_TIMEOUT_MS / 1000}s`,
+          ),
+        );
+      }, REALTIME_FETCH_TIMEOUT_MS);
+    });
+    const fetchPromise = (async () => {
+      const res = await fetch(
+        url,
+        controller ? { signal: controller.signal } : undefined,
+      );
+      if (!res.ok) {
+        throw new Error(`GTFS-RT ${url} failed: HTTP ${res.status}`);
+      }
+      return res.arrayBuffer();
+    })();
+    return await Promise.race([fetchPromise, timeoutPromise]);
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
   }
-  return res.arrayBuffer();
+}
+
+/**
+ * Decodes and ingests one feed result. Returns a failure message, or null
+ * on success. Decode runs BEFORE ingest, and ingest itself builds into
+ * temporary maps and only swaps them in on full success — so a corrupt
+ * payload (or a malformed entry mid-feed) can never clear the previous
+ * good snapshot. A failed feed leaves prior data untouched, exactly like
+ * a failed fetch.
+ */
+function ingestFeedResult(result, label, ingest) {
+  if (result.status !== 'fulfilled') {
+    const reason = result.reason;
+    const detail = reason instanceof Error ? reason.message : String(reason);
+    return `${label} failed: ${detail}`;
+  }
+  try {
+    ingest(decodeFeed(result.value));
+    return null;
+  } catch (e) {
+    const detail = e instanceof Error ? e.message : String(e);
+    return `${label} decode failed: ${detail}`;
+  }
 }
 
 async function refreshAllFeeds() {
+  // In-flight guard: overlapping callers (interval tick firing while a
+  // previous poll is still running) share one attempt instead of racing.
+  // Only the originating caller settles the guard and notifies listeners.
+  if (refreshInFlight) return refreshInFlight;
 
-  const [tripRes, vehRes] = await Promise.allSettled([
-    fetchProtobuf(TRIP_UPDATES_URL),
-    fetchProtobuf(VEHICLE_POSITIONS_URL),
-  ]);
+  refreshInFlight = (async () => {
+    realtimeLastAttemptMs = Date.now();
 
-  let successCount = 0;
+    const [tripRes, vehRes] = await Promise.allSettled([
+      fetchProtobuf(TRIP_UPDATES_URL),
+      fetchProtobuf(VEHICLE_POSITIONS_URL),
+    ]);
 
-  if (tripRes.status === 'fulfilled') {
-    ingestTripUpdates(decodeFeed(tripRes.value));
-    successCount += 1;
-  }
+    // Per-feed handling: one bad feed must not kill the other, and a
+    // failed feed must not clear the previous snapshot.
+    const failures = [];
+    const tripFailure = ingestFeedResult(tripRes, 'TripUpdates', ingestTripUpdates);
+    if (tripFailure) failures.push(tripFailure);
+    const vehFailure = ingestFeedResult(vehRes, 'VehiclePositions', ingestVehiclePositions);
+    if (vehFailure) failures.push(vehFailure);
 
-  if (vehRes.status === 'fulfilled') {
-    ingestVehiclePositions(decodeFeed(vehRes.value));
-    successCount += 1;
-  }
+    if (failures.length > 0) {
+      realtimeLastError = failures.join(' | ').slice(0, 200);
+    } else {
+      realtimeLastError = null;
+    }
 
+    if (tripFailure && vehFailure) {
+      realtimeConsecutiveFailures += 1;
+      throw new Error('All GTFS-RT feeds failed to refresh.');
+    }
 
-  if (successCount > 0) {
     realtimeLastUpdatedMs = Date.now();
-    return;
-  }
+    realtimeConsecutiveFailures = 0;
+  })();
 
-  throw new Error('All GTFS-RT feeds failed to refresh.');
+  try {
+    await refreshInFlight;
+  } finally {
+    refreshInFlight = null;
+    notifyDiagnosticsListeners();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -222,6 +340,38 @@ export function getVehiclePositions() {
 
 export function getRealtimeLastUpdatedMs() {
   return realtimeLastUpdatedMs;
+}
+
+/**
+ * Snapshot for diagnosis (splash share-log and the departures footer):
+ * last successful refresh, last attempt, last failure message, consecutive
+ * full failures, and how many trips currently carry live data. A count of
+ * 0 with a failure message means the feed itself is down; a large count
+ * while one trip still shows schedule-only points at matching, not the feed.
+ */
+export function getRealtimeDiagnostics() {
+  return {
+    lastUpdatedMs: realtimeLastUpdatedMs,
+    lastAttemptMs: realtimeLastAttemptMs,
+    lastError: realtimeLastError,
+    consecutiveFailures: realtimeConsecutiveFailures,
+    tripsWithLiveData: getTripIdsWithLiveUpdates().length,
+    vehiclesSeen: vehicleSnapshots.length,
+  };
+}
+
+/**
+ * Subscribe to settled refreshes (success or failure). Returns an
+ * unsubscribe function. Notifications are settle-only — never during
+ * render — so subscribers can recompute lists without render loops, and
+ * no extra network calls are made: the existing 30s poll is the only fetch.
+ */
+export function subscribeRealtimeDiagnostics(listener) {
+  if (typeof listener !== 'function') return () => {};
+  diagnosticsListeners.add(listener);
+  return () => {
+    diagnosticsListeners.delete(listener);
+  };
 }
 
 /**
@@ -267,6 +417,8 @@ export function getLiveDepartures(stopId, limit = 10, options = {}) {
 
 /**
  * Starts the 30-second polling loop. Safe to call once after static GTFS loads.
+ * Overlapping ticks share one in-flight refresh (see refreshAllFeeds), and
+ * each fetch carries its own 20s timeout, so a hung feed cannot stall the loop.
  */
 export function startRealtimeUpdates() {
   stopRealtimeUpdates();

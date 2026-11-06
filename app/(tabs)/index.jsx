@@ -20,7 +20,7 @@ import {
 import { Platform } from 'react-native';
 import SleekHeaderBar from '../../components/SleekHeaderBar';
 import * as Location from 'expo-location';
-import { useRouter } from 'expo-router';
+import { useFocusEffect, useRouter } from 'expo-router';
 import { MaterialIcons } from '@expo/vector-icons';
 import {
   BottomSheetBackdrop,
@@ -32,9 +32,22 @@ import {
 import HomeMap from '../../components/HomeMap';
 import StartupLoadingScreen from '../../components/StartupLoadingScreen';
 import DepartureListRow from '../../components/DepartureListRow';
+import BusDownloadBanner from '../../components/BusDownloadBanner';
 import { useGtfsData } from '../../contexts/GtfsDataContext';
+import { recordScreenView } from '../../services/usageCounts';
 import { useLoading } from '../../contexts/LoadingContext';
-import { getShapePolylinesForMap, getStopRouteTypes, getStops } from '../../services/gtfsService';
+import {
+  ensureSchedulesForDate,
+  getShapePolylinesForMap,
+  getStopRouteTypes,
+  getStops,
+  isScheduleLoaded,
+} from '../../services/gtfsService';
+import {
+  getBusDownloadState,
+  subscribeBusDownloadState,
+} from '../../services/gtfsSqliteService';
+import { DateTime } from 'luxon';
 import {
   getLiveDepartures,
   getVehiclePositions,
@@ -70,6 +83,7 @@ export default function HomeScreen() {
     error,
     progressMessage,
     progressPercent,
+    startupStep,
     loadStartAt,
     lastProgressAt,
     loadAttempt,
@@ -88,6 +102,15 @@ export default function HomeScreen() {
   const [hasLocationPermission, setHasLocationPermission] = useState(false);
   const [currentRegion, setCurrentRegion] = useState(null);
   const [stopFilter, setStopFilter] = useState('trains');
+  // Bus download banner state for the home bus filter: same shared bus
+  // download state as the other surfaces, plus whether bus schedules are
+  // loaded for today. Opening the bus filter requests bus schedules —
+  // if the background bus download has not finished, the on-demand
+  // fallback in ensureSchedulesForDate downloads them blocking and the
+  // banner shows the live time left instead of an empty map.
+  const [busDownloadState, setBusDownloadState] = useState(() => getBusDownloadState());
+  const [busLoadedForToday, setBusLoadedForToday] = useState(false);
+  const [busEnsureDone, setBusEnsureDone] = useState(false);
   const mapRef = useRef(null);
   /** Opens sheet after React applies selectedStop (BottomSheet needs fresh data). */
   const openSheetAfterSelectRef = useRef(false);
@@ -104,6 +127,14 @@ export default function HomeScreen() {
   const sheetRef = useRef(null);
   /** One ref per train trip_id so we can call animateMarkerToCoordinate. */
   const vehicleMarkerRefs = useRef({});
+
+  // Anonymous usage count: one 'home' screen row per focus. No UI,
+  // no state, no effect on the screen's own work.
+  useFocusEffect(
+    useCallback(() => {
+      recordScreenView('home');
+    }, []),
+  );
 
   // Ask for location immediately; GTFS may still be syncing in background.
   useEffect(() => {
@@ -205,6 +236,59 @@ export default function HomeScreen() {
     });
   }, [vehicles]);
 
+  useEffect(() => {
+    const unsubscribe = subscribeBusDownloadState((next) => {
+      setBusDownloadState(next);
+    });
+    return unsubscribe;
+  }, []);
+
+  const retryBusDownload = useCallback(() => {
+    if (!ready) return;
+    const today = DateTime.now().setZone('America/Toronto').toFormat('yyyyMMdd');
+    setBusEnsureDone(false);
+    ensureSchedulesForDate(today, { modes: { train: false, bus: true } })
+      .then(() => {
+        setBusLoadedForToday(isScheduleLoaded(today, 'bus'));
+        setBusEnsureDone(true);
+      })
+      .catch(() => {
+        setBusEnsureDone(true);
+      });
+  }, [ready]);
+
+  // Opening the bus filter is a bus-schedule request: ensure today's bus
+  // schedules (on-demand download with time-left banner when missing).
+  // Re-runs when a bus download completes elsewhere, so the sheet and
+  // pins refresh once bus data lands.
+  useEffect(() => {
+    if (!ready || stopFilter !== 'buses') return undefined;
+    let cancelled = false;
+    const today = DateTime.now().setZone('America/Toronto').toFormat('yyyyMMdd');
+    setBusEnsureDone(false);
+    ensureSchedulesForDate(today, { modes: { train: false, bus: true } })
+      .then(() => {
+        if (cancelled) return;
+        setBusLoadedForToday(isScheduleLoaded(today, 'bus'));
+        setBusEnsureDone(true);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setBusEnsureDone(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [ready, stopFilter, busDownloadState.status === 'done' ? 'bus-done' : 'bus-not-done']);
+
+  const showBusBanner =
+    ready &&
+    stopFilter === 'buses' &&
+    !busLoadedForToday &&
+    (busDownloadState?.status === 'downloading' ||
+      busDownloadState?.status === 'error' ||
+      busEnsureDone);
+
   // --- Next 5 live departures for the sheet ---
   const sheetDepartures = useMemo(() => {
     if (!selectedStop) return [];
@@ -212,7 +296,7 @@ export default function HomeScreen() {
     if (stopFilter === 'trains') mode = 'train';
     if (stopFilter === 'buses') mode = 'bus';
     return getLiveDepartures(String(selectedStop.stop_id), 5, { mode });
-  }, [selectedStop, liveTick, stopFilter]);
+  }, [selectedStop, liveTick, stopFilter, busLoadedForToday]);
 
   const openSheet = useCallback((stop) => {
     setSelectedStop(stop);
@@ -295,7 +379,7 @@ export default function HomeScreen() {
         return { ...s, lat, lon, stopKind, routeTypes };
       })
       .filter(Boolean);
-  }, [mapStops, ready, stopsReady]);
+  }, [mapStops, ready, stopsReady, busLoadedForToday]);
 
   const trainMarkers = useMemo(
     () =>
@@ -369,7 +453,7 @@ export default function HomeScreen() {
     ) || 'startup';
   const startupDetailText = loadingFromCache
     ? 'Loading schedules already saved on this phone.'
-    : 'Downloading or rebuilding GO Transit schedules on this phone.';
+    : 'Getting your transit schedules ready on this phone.';
   const loadElapsedMs = Math.max(0, nowTick - (loadStartAt || nowTick));
   const etaSeconds =
     progressPercent >= 0.08 && progressPercent < 0.99
@@ -396,6 +480,7 @@ export default function HomeScreen() {
         errorMessage={error || ''}
         progressPercent={progressPercent}
         progressMessage={progressMessage}
+        startupStep={startupStep || ''}
         stalled={stalled}
         detailText={startupElapsedSeconds >= 10 ? startupDetailText : ''}
         etaText={startupEtaText}
@@ -444,6 +529,10 @@ export default function HomeScreen() {
           {renderFilterChip('buses', 'Buses')}
         </View>
       </View>
+
+      {showBusBanner ? (
+        <BusDownloadBanner state={busDownloadState} onRetry={retryBusDownload} />
+      ) : null}
 
       {error ? (
         <View style={styles.syncBanner}>
@@ -508,9 +597,13 @@ export default function HomeScreen() {
           </Text>
 
           {sheetDepartures.length === 0 ? (
-            <Text style={styles.sheetEmpty}>
-              No upcoming departures found for this stop today.
-            </Text>
+            showBusBanner ? (
+              <BusDownloadBanner state={busDownloadState} onRetry={retryBusDownload} />
+            ) : (
+              <Text style={styles.sheetEmpty}>
+                No upcoming departures found for this stop today.
+              </Text>
+            )
           ) : (
             sheetDepartures.map((item) => {
               return (

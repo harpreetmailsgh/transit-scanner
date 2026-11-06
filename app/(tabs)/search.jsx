@@ -22,10 +22,12 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { MaterialCommunityIcons, MaterialIcons } from '@expo/vector-icons';
 import TripResultCard from '../../components/TripResultCard';
-import { useRouter } from 'expo-router';
+import { useFocusEffect, useRouter } from 'expo-router';
 import { DateTime } from 'luxon';
 
 import { useGtfsData } from '../../contexts/GtfsDataContext';
+import { recordScreenView } from '../../services/usageCounts';
+import BusDownloadBanner from '../../components/BusDownloadBanner';
 import {
   ensureSchedulesForDate,
   getTripsFromToForDate,
@@ -34,7 +36,12 @@ import {
   getStopRouteTypes,
   getPlanningDateBounds,
   getTripStops,
+  isScheduleLoaded,
 } from '../../services/gtfsService';
+import {
+  getBusDownloadState,
+  subscribeBusDownloadState,
+} from '../../services/gtfsSqliteService';
 import { getLiveDepartures, getDelayForStop, getTripIdsWithLiveUpdates } from '../../services/gtfsRealtimeService';
 import { getStopNextService } from '../../services/metrolinxApiService';
 
@@ -202,7 +209,18 @@ function MonthCalendar({
 
 export default function SearchScreen() {
   const router = useRouter();
-  const { ready, error } = useGtfsData();
+  // coverageVersion bumps when a post-ready prefetch lands (e.g. next
+  // week's file), so dateBounds recomputes and the picker max extends
+  // without an app restart — even while the picker is open.
+  const { ready, error, coverageVersion } = useGtfsData();
+
+  // Anonymous usage count: one 'search' screen row per focus. No UI,
+  // no state, no effect on the screen's own work.
+  useFocusEffect(
+    useCallback(() => {
+      recordScreenView('search');
+    }, []),
+  );
 
   const [fromQuery, setFromQuery] = useState('');
   const [fromStop, setFromStop] = useState(null);
@@ -224,14 +242,41 @@ export default function SearchScreen() {
   const [datePickerOpen, setDatePickerOpen] = useState(false);
   const [calendarMonth, setCalendarMonth] = useState(DateTime.now().setZone('America/Toronto').startOf('month'));
   const [schedulesForSearchReady, setSchedulesForSearchReady] = useState(true);
+  // Bus download banner state: the shared bus download state (live
+  // time-left text) plus whether bus schedules are loaded for the
+  // selected date. busDownloadSeq bumps when a bus download completes so
+  // both the ensure effect and the picker bounds recompute without a
+  // restart — including when the bus week lands via the on-demand path,
+  // which the context's coverageVersion bump does not cover.
+  const [busDownloadState, setBusDownloadState] = useState(() => getBusDownloadState());
+  const [busDownloadSeq, setBusDownloadSeq] = useState(0);
+  const [busLoadedForDate, setBusLoadedForDate] = useState(false);
+  const [busEnsureDone, setBusEnsureDone] = useState(false);
+
+  useEffect(() => {
+    const unsubscribe = subscribeBusDownloadState((next) => {
+      setBusDownloadState(next);
+      if (next?.status === 'done') setBusDownloadSeq((n) => n + 1);
+    });
+    return unsubscribe;
+  }, []);
 
   const dateBounds = useMemo(() => {
     if (!ready) {
       const today = DateTime.now().setZone('America/Toronto').toFormat('yyyyMMdd');
       return { minYmd: today, maxYmd: today };
     }
-    return getPlanningDateBounds();
-  }, [ready, selectedDate]);
+    // max = PER-MODE installed coverage end: train-only selection → train
+    // end, bus-only → bus end, both → min(trainEnd, busEnd). Default
+    // selection is {train: true, bus: false}, so the default max is the
+    // train end. No absolute-max bound, no download-on-tap: dates beyond
+    // max are rendered DISABLED by MonthCalendar (disabled + guarded
+    // onPress), so tapping one does nothing — no download, no spinner, no
+    // selection jump. The old post-hoc clamp below only corrects a
+    // previously-valid selection when coverage itself contracts; it is
+    // never a tap path.
+    return getPlanningDateBounds(selectedModes);
+  }, [ready, selectedDate, coverageVersion, selectedModes, busDownloadSeq]);
 
   const stopMatchesSelectedModes = useCallback((stop) => {
     const routeTypes = getStopRouteTypes(stop?.stop_id);
@@ -259,21 +304,55 @@ export default function SearchScreen() {
     });
   }, [ready, dateBounds.minYmd, dateBounds.maxYmd]);
 
+  const applyBusEnsureResult = useCallback(() => {
+    setBusLoadedForDate(selectedModes.bus ? isScheduleLoaded(selectedDate, 'bus') : false);
+    setBusEnsureDone(true);
+  }, [selectedDate, selectedModes.bus]);
+
+  const retryBusDownload = useCallback(() => {
+    if (!ready) return;
+    setBusEnsureDone(false);
+    ensureSchedulesForDate(selectedDate, { modes: selectedModes })
+      .then((result) => {
+        applyBusEnsureResult(result);
+      })
+      .catch(() => {
+        setBusEnsureDone(true);
+      });
+  }, [ready, selectedDate, selectedModes, applyBusEnsureResult]);
+
   useEffect(() => {
     if (!ready) return undefined;
     let cancelled = false;
     setSchedulesForSearchReady(false);
+    setBusEnsureDone(false);
     ensureSchedulesForDate(selectedDate, { modes: selectedModes })
-      .then(() => {
-        if (!cancelled) setSchedulesForSearchReady(true);
+      .then((result) => {
+        if (cancelled) return;
+        setSchedulesForSearchReady(true);
+        applyBusEnsureResult(result);
       })
       .catch(() => {
-        if (!cancelled) setSchedulesForSearchReady(true);
+        if (cancelled) return;
+        setSchedulesForSearchReady(true);
+        setBusEnsureDone(true);
       });
     return () => {
       cancelled = true;
     };
-  }, [ready, selectedDate, selectedModes]);
+  }, [ready, selectedDate, selectedModes, busDownloadSeq, applyBusEnsureResult]);
+
+  // Show the banner only when bus is selected and bus schedules are not
+  // loaded for the selected date — and only once a download is actually
+  // in flight, failed, or an ensure has resolved without loading bus (so
+  // a fast local bus load never flashes the banner).
+  const showBusBanner =
+    ready &&
+    selectedModes.bus &&
+    !busLoadedForDate &&
+    (busDownloadState?.status === 'downloading' ||
+      busDownloadState?.status === 'error' ||
+      busEnsureDone);
 
   useEffect(() => {
     let cancelled = false;
@@ -737,6 +816,10 @@ export default function SearchScreen() {
               </Text>
             </TouchableOpacity>
           </ScrollView>
+
+          {showBusBanner ? (
+            <BusDownloadBanner state={busDownloadState} onRetry={retryBusDownload} />
+          ) : null}
 
           {/* Date picker modal */}
           {datePickerOpen && (

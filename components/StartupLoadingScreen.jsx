@@ -2,7 +2,29 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Animated, Easing, Pressable, Share, StyleSheet, Text, View } from 'react-native';
 import Svg, { Circle, Ellipse } from 'react-native-svg';
 
+import { getRealtimeDiagnostics } from '../services/gtfsRealtimeService';
+import { getLastStartupTiming } from '../services/startupTelemetry';
+
 const GO_GREEN = '#00853F';
+
+// Splash step progress (item 4a): plain words for each startup step.
+// Unknown or missing steps fall back to the previous generic line, so a
+// bad step value can never blank or crash the screen.
+const STARTUP_STEP_NAMES = {
+  checking: 'Checking saved schedules…',
+  downloading: 'Downloading schedules…',
+  loading: 'Loading trips…',
+  map: 'Getting the map ready…',
+  ready: 'Ready',
+};
+
+function startupStepName(step) {
+  try {
+    return STARTUP_STEP_NAMES[String(step || '').trim().toLowerCase()] || null;
+  } catch {
+    return null;
+  }
+}
 
 function derivePipelinePhase(message) {
   const text = String(message || '').toLowerCase();
@@ -21,6 +43,7 @@ export default function StartupLoadingScreen({
   errorMessage = '',
   progressPercent = 0,
   progressMessage = 'Loading GO Transit data...',
+  startupStep = '',
   stalled = false,
   detailText = '',
   etaText = '',
@@ -45,10 +68,27 @@ export default function StartupLoadingScreen({
     () => servicePhaseDetail || derivePipelinePhase(progressMessage),
     [progressMessage, servicePhaseDetail],
   );
-  const userMessage = progress >= 1 ? 'Opening map...' : 'Preparing your transit map';
+  // Once the error card is showing, the loading lines must not claim work
+  // is still in progress — the load has failed and only Retry restarts it.
+  // Otherwise the on-screen line is the current startup step in plain
+  // words; only when no step is known yet (e.g. stops bootstrap, before
+  // the schedule load starts) does it fall back to the generic line.
+  const stepName = errorMessage ? null : startupStepName(startupStep);
+  const userMessage = errorMessage
+    ? 'Something went wrong'
+    : stepName ||
+      (progress >= 1
+        ? 'Opening map...'
+        : 'Preparing your transit map');
 
   const diagnosticsText = useMemo(() => {
     const traceText = startupTrace.length ? startupTrace.join('\n') : '(no recent trace lines)';
+    // Read live at render: the home screen re-renders every second while
+    // this splash is visible, so these lines stay fresh through the
+    // startup window. Post-ready diagnosis lives on the departures footer,
+    // which subscribes to the same snapshot.
+    const live = getRealtimeDiagnostics();
+    const lastTiming = getLastStartupTiming();
     return [
       'Transit Scanner startup diagnostics',
       `attempt=${loadAttempt}`,
@@ -62,6 +102,15 @@ export default function StartupLoadingScreen({
       `phase=${pipelinePhase}`,
       `stage=${progressMessage || 'Loading...'}`,
       `stalled=${stalled ? 'yes' : 'no'}`,
+      `live_last_updated=${live.lastUpdatedMs ? new Date(live.lastUpdatedMs).toISOString() : 'never'}`,
+      `live_trips_with_data=${live.tripsWithLiveData}`,
+      `live_consecutive_failures=${live.consecutiveFailures}`,
+      `live_last_error=${live.lastError || 'none'}`,
+      // Last launch's timings when a previous ready in this session
+      // recorded them (null on a first launch — lines omitted).
+      lastTiming ? `launch_total_ms=${lastTiming.totalMs}` : null,
+      lastTiming ? `launch_stops_ms=${lastTiming.stopsMs}` : null,
+      lastTiming ? `launch_schedules_ms=${lastTiming.schedulesMs}` : null,
       debugLogPath ? `debug_log=${debugLogPath}` : null,
       '',
       'trace:',
@@ -138,8 +187,8 @@ export default function StartupLoadingScreen({
         <View style={[styles.progressBar, { width: `${Math.round(progress * 100)}%` }]} />
       </View>
       <Text style={styles.loadingText}>{userMessage}</Text>
-      {detailText ? <Text style={styles.detailText}>{detailText}</Text> : null}
-      {etaText ? <Text style={styles.etaText}>{etaText}</Text> : null}
+      {detailText && !errorMessage ? <Text style={styles.detailText}>{detailText}</Text> : null}
+      {etaText && !errorMessage ? <Text style={styles.etaText}>{etaText}</Text> : null}
 
       {errorMessage ? (
         <View style={styles.errorCard}>
@@ -167,12 +216,12 @@ export default function StartupLoadingScreen({
         </View>
       ) : null}
 
-      {stalled ? (
-        <Text style={styles.helperText}>Still working. This can take longer on slower networks.</Text>
+      {stalled && !errorMessage ? (
+        <Text style={styles.helperText}>Still working — this can take a while.</Text>
       ) : null}
       {debugLogCaptured ? (
         <Text style={styles.debugText}>
-          Debug snapshot captured{debugLogPath ? `: ${debugLogPath}` : '.'}
+          Startup snapshot saved{debugLogPath ? `: ${debugLogPath}` : '.'}
         </Text>
       ) : null}
     </View>

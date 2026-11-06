@@ -20,7 +20,7 @@ import {
 import { Platform } from 'react-native';
 import SleekHeaderBar from '../../components/SleekHeaderBar';
 import * as Location from 'expo-location';
-import { useRouter } from 'expo-router';
+import { useFocusEffect, useRouter } from 'expo-router';
 import { MaterialIcons } from '@expo/vector-icons';
 import {
   BottomSheetBackdrop,
@@ -33,6 +33,7 @@ import HomeMap from '../../components/HomeMap';
 import StartupLoadingScreen from '../../components/StartupLoadingScreen';
 import DepartureListRow from '../../components/DepartureListRow';
 import { useGtfsData } from '../../contexts/GtfsDataContext';
+import { recordScreenView } from '../../services/usageCounts';
 import { useLoading } from '../../contexts/LoadingContext';
 import { getShapePolylinesForMap, getStopRouteTypes, getStops } from '../../services/gtfsService';
 import {
@@ -70,6 +71,7 @@ export default function HomeScreen() {
     error,
     progressMessage,
     progressPercent,
+    startupStep,
     loadStartAt,
     lastProgressAt,
     loadAttempt,
@@ -104,6 +106,14 @@ export default function HomeScreen() {
   const sheetRef = useRef(null);
   /** One ref per train trip_id so we can call animateMarkerToCoordinate. */
   const vehicleMarkerRefs = useRef({});
+
+  // Anonymous usage count: one 'home' screen row per focus. No UI,
+  // no state, no effect on the screen's own work.
+  useFocusEffect(
+    useCallback(() => {
+      recordScreenView('home');
+    }, []),
+  );
 
   // Ask for location immediately; GTFS may still be syncing in background.
   useEffect(() => {
@@ -369,7 +379,7 @@ export default function HomeScreen() {
     ) || 'startup';
   const startupDetailText = loadingFromCache
     ? 'Loading schedules already saved on this phone.'
-    : 'Downloading or rebuilding GO Transit schedules on this phone.';
+    : 'Getting your transit schedules ready on this phone.';
   const loadElapsedMs = Math.max(0, nowTick - (loadStartAt || nowTick));
   const etaSeconds =
     progressPercent >= 0.08 && progressPercent < 0.99
@@ -396,6 +406,7 @@ export default function HomeScreen() {
         errorMessage={error || ''}
         progressPercent={progressPercent}
         progressMessage={progressMessage}
+        startupStep={startupStep || ''}
         stalled={stalled}
         detailText={startupElapsedSeconds >= 10 ? startupDetailText : ''}
         etaText={startupEtaText}

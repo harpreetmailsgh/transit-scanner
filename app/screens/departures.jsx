@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   FlatList,
@@ -14,6 +14,7 @@ import { Ionicons } from '@expo/vector-icons';
 import DepartureListRow from '../../components/DepartureListRow';
 import { getLiveDepartures } from '../../services/gtfsRealtimeService';
 import { maybeAskForReview } from '../../services/reviewPrompt';
+import { recordScreenView, recordStationCheck } from '../../services/usageCounts';
 
 const GO_GREEN = '#00853F';
 
@@ -23,6 +24,10 @@ export default function DeparturesScreen() {
   const stopId = params.stopId ? String(params.stopId) : '';
   const stopName = params.stopName ? String(params.stopName) : 'Stop';
   const stopFilter = params.stopFilter ? String(params.stopFilter) : 'trains';
+  // Last station view already counted, so a re-run of the load effect
+  // below is not counted as a second view. A remount (back out and back
+  // in, or a different station) resets it and counts again.
+  const lastStationCheckRef = useRef('');
   const [departures, setDepartures] = useState([]);
   const [loading, setLoading] = useState(true);
 
@@ -42,6 +47,17 @@ export default function DeparturesScreen() {
     setLoading(false);
     if (Array.isArray(deps) && deps.length > 0) {
       maybeAskForReview();
+      // Anonymous usage counts, once per view of this station: a
+      // station_checks row (stop name from params + first departure's
+      // line name) and a 'departures' screen row. A station with no
+      // departures shown records nothing: its line is unknown and is
+      // never invented.
+      const checkKey = `${stopId}|${stopFilter}`;
+      if (lastStationCheckRef.current !== checkKey) {
+        lastStationCheckRef.current = checkKey;
+        recordStationCheck({ stationName: stopName, lineName: deps[0]?.lineName });
+        recordScreenView('departures');
+      }
     }
   }, [stopId, stopFilter]);
 

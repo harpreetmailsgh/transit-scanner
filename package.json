@@ -3,6 +3,7 @@
   "version": "1.1.0",
   "main": "expo-router/entry",
   "scripts": {
+    "postinstall": "patch-package",
     "start": "expo start",
     "android": "expo run:android",
     "ios": "expo run:ios",
@@ -54,6 +55,7 @@
   "private": true,
   "devDependencies": {
     "babel-preset-expo": "~54.0.10",
-    "better-sqlite3": "^11.8.1"
+    "better-sqlite3": "^11.8.1",
+    "patch-package": "^8.0.1"
   }
 }

@@ -27,7 +27,8 @@ import {
 } from '../services/gtfsRealtimeService';
 import { evaluateAlertsFromFeed, resumeRideTracking } from '../services/rideTrackingService';
 import { reconcileOnLaunch, refreshFromFeed } from '../services/liveActivityService';
-import { reportStartupTiming } from '../services/startupTelemetry';
+import { recordStartupTiming, reportStartupTiming } from '../services/startupTelemetry';
+import { recordAppOpen } from '../services/usageCounts';
 
 /**
  * If loading takes longer than this, we fail with a visible error.
@@ -71,6 +72,7 @@ const GtfsDataContext = createContext({
   error: null,
   progressMessage: '',
   progressPercent: 0,
+  startupStep: '',
   loadStartAt: 0,
   lastProgressAt: 0,
   loadAttempt: 0,
@@ -79,6 +81,7 @@ const GtfsDataContext = createContext({
   stopsSource: 'none',
   debugLogPath: null,
   debugLogCaptured: false,
+  startupTiming: null,
   retryLoad: () => {},
 });
 
@@ -104,6 +107,69 @@ function mapProgressMessageToPercent(message, currentPercent) {
   return Math.min(0.95, Math.max(currentPercent, currentPercent + 0.03));
 }
 
+// Splash step progress (item 4a): the five steps the start screen shows,
+// in order. Each step has a floor percent so the bar only ever moves
+// forward, even when a service reports a lower raw percent (e.g. the
+// 'Loading startup schedules...' event at 0.55 arrives after core load
+// at 0.62). Steps never move backward: an older step arriving late is
+// ignored. Unknown or missing steps are ignored, never crash.
+const STARTUP_STEPS = ['checking', 'downloading', 'loading', 'map', 'ready'];
+const STARTUP_STEP_NAMES = {
+  checking: 'Checking saved schedules…',
+  downloading: 'Downloading schedules…',
+  loading: 'Loading trips…',
+  map: 'Getting the map ready…',
+  ready: 'Ready',
+};
+const STARTUP_STEP_FLOORS = {
+  checking: 0.02,
+  downloading: 0.05,
+  loading: 0.55,
+  map: 0.97,
+  ready: 1,
+};
+
+function normalizeStartupStep(step) {
+  try {
+    const key = String(step || '').trim().toLowerCase();
+    return STARTUP_STEPS.includes(key) ? key : null;
+  } catch {
+    return null;
+  }
+}
+
+// Fallback for progress events without a step tag (legacy zip path,
+// third-party callbacks): classify by the message text. Tagged events
+// always win over this classifier.
+function classifyStartupStepFromMessage(message) {
+  try {
+    const text = String(message || '').toLowerCase();
+    if (!text) return null;
+    if (text.includes('downloading')) return 'downloading';
+    if (
+      text.includes('checking') ||
+      text.includes('loading cached') ||
+      text.includes('preparing go transit data')
+    ) {
+      return 'checking';
+    }
+    if (
+      text.includes('reading stops') ||
+      text.includes('parsing') ||
+      text.includes('loading schedules') ||
+      text.includes('loading startup') ||
+      text.includes('persisting') ||
+      text.includes('finalizing') ||
+      text.includes('schedules database ready')
+    ) {
+      return 'loading';
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 export function useGtfsData() {
   return useContext(GtfsDataContext);
 }
@@ -115,6 +181,8 @@ export function GtfsDataProvider({ children }) {
   const [error, setError] = useState(null);
   const [progressMessage, setProgressMessage] = useState('');
   const [progressPercent, setProgressPercent] = useState(0);
+  const [startupStep, setStartupStep] = useState('');
+  const startupStepRef = useRef('');
   const [loadStartAt, setLoadStartAt] = useState(0);
   const [lastProgressAt, setLastProgressAt] = useState(0);
   const [startupTrace, setStartupTrace] = useState([]);
@@ -125,6 +193,7 @@ export function GtfsDataProvider({ children }) {
   const [debugLogPath, setDebugLogPath] = useState(null);
   const [debugLogCaptured, setDebugLogCaptured] = useState(false);
   const [loadAttempt, setLoadAttempt] = useState(0);
+  const [startupTiming, setStartupTiming] = useState(null);
   const lastProgressRef = useRef('(starting)');
   const progressPercentRef = useRef(0);
   const startupTraceRef = useRef([]);
@@ -140,6 +209,31 @@ export function GtfsDataProvider({ children }) {
     startupTraceRef.current = next.slice(-45);
     // Keep a short visible trace feed for startup diagnostics UI.
     setStartupTrace(startupTraceRef.current.slice(-8));
+  }, []);
+
+  // Fail-safe step advance: validates the step, never moves backward,
+  // and raises the bar to the step floor (monotonic). Any failure here
+  // is swallowed — step display must never break startup.
+  const applyStartupStep = React.useCallback((step) => {
+    try {
+      const next = normalizeStartupStep(step);
+      if (!next) return;
+      const prevIndex = STARTUP_STEPS.indexOf(startupStepRef.current);
+      const nextIndex = STARTUP_STEPS.indexOf(next);
+      if (nextIndex <= prevIndex && startupStepRef.current) return;
+      startupStepRef.current = next;
+      setStartupStep(next);
+      const floor = STARTUP_STEP_FLOORS[next];
+      if (Number.isFinite(floor)) {
+        setProgressPercent((prev) => {
+          const value = Math.max(prev, floor);
+          progressPercentRef.current = Math.max(progressPercentRef.current, value);
+          return value;
+        });
+      }
+    } catch {
+      // Step display must never break startup.
+    }
   }, []);
 
   const syncServiceDiagnostics = React.useCallback(() => {
@@ -189,6 +283,8 @@ export function GtfsDataProvider({ children }) {
     setError(null);
     setProgressPercent(0);
     progressPercentRef.current = 0;
+    setStartupStep('');
+    startupStepRef.current = '';
     setProgressMessage('Loading stops...');
     setLoadStartAt(startedAt);
     setLastProgressAt(startedAt);
@@ -197,6 +293,7 @@ export function GtfsDataProvider({ children }) {
     setStopsSource('none');
     setDebugLogPath(null);
     setDebugLogCaptured(false);
+    setStartupTiming(null);
     finishedRef.current = false;
     telemetryReportedRef.current = false;
     startupTraceRef.current = [];
@@ -306,6 +403,16 @@ export function GtfsDataProvider({ children }) {
 
                 lastProgressTickMs = Date.now();
                 setProgressMessage(m);
+                // Step first (floor), raw percent below only raises it.
+                // Tagged step wins; untagged messages fall back to the
+                // text classifier. A bad step value is ignored, never fatal.
+                try {
+                  const taggedStep =
+                    typeof update === 'object' && update !== null ? update.step : null;
+                  applyStartupStep(taggedStep || classifyStartupStepFromMessage(m));
+                } catch {
+                  // Step display must never break startup.
+                }
                 setLastProgressAt(Date.now());
                 setProgressPercent((prev) => {
                   if (hasRawPercent) {
@@ -335,10 +442,13 @@ export function GtfsDataProvider({ children }) {
             setStopsReady(true);
             localStopsReady = true;
           }
+          // Schedules are loaded; the remaining work before the map can
+          // open is starting live updates and reconciling — the 'map' step.
+          applyStartupStep('map');
           startRealtimeUpdates();
           // Live Activity: reconcile any orphaned activity from a previous
-          // run, then keep the active one fresh on a 60s tick (the service
-          // itself throttles native updates to max once per 60s).
+          // run, then keep the active one fresh on a 30s tick (the service
+          // itself throttles native updates to max once per 30s).
           reconcileOnLaunch().catch(() => {});
           // Auto-start was removed in v1.2: one-time cleanup unregisters
           // any station geofences it left registered on this device.
@@ -347,23 +457,32 @@ export function GtfsDataProvider({ children }) {
           liveRefreshTimer = setInterval(() => {
             refreshFromFeed().catch(() => {});
             evaluateAlertsFromFeed().catch(() => {});
-          }, 60000);
+          }, 30000);
           setProgressPercent(1);
           progressPercentRef.current = 1;
           setProgressMessage('Ready');
+          applyStartupStep('ready');
           setLastProgressAt(Date.now());
           appendStartupTrace('100% | ready');
           setSchedulesReady(true);
           setReady(true);
-          // Telemetry: one silent backend report per successful ready (no UI).
+          // Telemetry: one silent backend report per successful ready, plus
+          // the same computed values kept in memory for in-app display
+          // (departures footer). The report call itself is unchanged.
           if (!telemetryReportedRef.current) {
             telemetryReportedRef.current = true;
             const readyAt = Date.now();
-            reportStartupTiming({
+            const timing = {
               totalMs: readyAt - startedAt,
               stopsMs: stopsDoneAt - startedAt,
               schedulesMs: schedulesDoneAt - stopsDoneAt,
-            }).catch(() => {});
+            };
+            setStartupTiming(recordStartupTiming(timing));
+            reportStartupTiming(timing).catch(() => {});
+            // Anonymous usage count: one 'open' row per launch, queued
+            // with the other counts. Same guard as the timings report,
+            // so a launch is counted exactly once.
+            recordAppOpen();
           }
           finishedRef.current = true;
         }
@@ -433,7 +552,7 @@ export function GtfsDataProvider({ children }) {
       if (liveRefreshTimer) clearInterval(liveRefreshTimer);
       stopRealtimeUpdates();
     };
-  }, [appendStartupTrace, loadAttempt, syncServiceDiagnostics]);
+  }, [appendStartupTrace, applyStartupStep, loadAttempt, syncServiceDiagnostics]);
 
   const value = useMemo(
     () => ({
@@ -443,6 +562,7 @@ export function GtfsDataProvider({ children }) {
       error,
       progressMessage,
       progressPercent,
+      startupStep,
       loadStartAt,
       lastProgressAt,
       loadAttempt,
@@ -453,6 +573,7 @@ export function GtfsDataProvider({ children }) {
       servicePhaseDetail,
       debugLogPath,
       debugLogCaptured,
+      startupTiming,
       retryLoad,
     }),
     [
@@ -462,6 +583,7 @@ export function GtfsDataProvider({ children }) {
       error,
       progressMessage,
       progressPercent,
+      startupStep,
       loadStartAt,
       lastProgressAt,
       loadAttempt,
@@ -472,6 +594,7 @@ export function GtfsDataProvider({ children }) {
       servicePhaseDetail,
       debugLogPath,
       debugLogCaptured,
+      startupTiming,
       retryLoad,
     ],
   );

@@ -23,7 +23,7 @@ import {
 
 const SESSION_FILE_NAME = 'active-live-activity-v1.json';
 const STALE_FEED_MS = 5 * 60 * 1000;
-const UPDATE_THROTTLE_MS = 60 * 1000;
+const UPDATE_THROTTLE_MS = 30 * 1000;
 const ETA_CHANGE_THRESHOLD_MS = 60 * 1000;
 const VANISH_BACKSTOP_MS = 20 * 60 * 1000;
 const GO_GREEN = '#00853F';
@@ -67,14 +67,99 @@ async function clearSession() {
   }
 }
 
+/**
+ * Whether Live Activities are currently enabled for the app, via the
+ * patched native query (ExpoLiveActivityModule.areActivitiesEnabled).
+ * Returns null when the answer is unavailable (non-iOS, or a build whose
+ * native module predates the patched query) so callers can fall back to
+ * the generic failure path instead of guessing.
+ */
+export async function isLaEnabled() {
+  try {
+    if (Platform.OS !== 'ios') return null;
+    const fn = LiveActivity.areActivitiesEnabled;
+    if (typeof fn !== 'function') return null;
+    const value = fn();
+    if (value === true) return true;
+    if (value === false) return false;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Activity dismissal detection: the library's onStateChange listener.
+// Installed once (module lifetime) so a dismissal clears the stale live
+// session even when no screen is subscribed; trip-detail subscribes for a
+// re-render. Only 'dismissed'/'ended' for OUR activity id clear anything —
+// 'active'/'pending'/'stale' never do. Our own stopActivity also ends the
+// activity, but endCurrentActivity clears the session first (or in its
+// finally), so a racing 'ended' event finds no session and is ignored.
+// ---------------------------------------------------------------------------
+let laListenerInstalled = false;
+const laDismissalCallbacks = new Set();
+
+async function onLaStateChange(event) {
+  try {
+    const state = event?.activityState;
+    if (state !== 'dismissed' && state !== 'ended') return;
+    const session = await readSession();
+    if (!session || !session.activityId || session.activityId !== event?.activityID) return;
+    await clearSession();
+    resetTrackers();
+    laDismissalCallbacks.forEach((cb) => {
+      try {
+        cb();
+      } catch {
+        // one bad callback must not block the rest
+      }
+    });
+  } catch {
+    // never throws
+  }
+}
+
+function ensureLaListener() {
+  if (laListenerInstalled || Platform.OS !== 'ios') return;
+  try {
+    const sub = LiveActivity.addActivityUpdatesListener((event) => {
+      onLaStateChange(event);
+    });
+    if (sub) laListenerInstalled = true;
+  } catch {
+    // listener unavailable; dismissal is then picked up by re-derivation
+  }
+}
+
+/**
+ * Subscribes `callback` to dismissal of our own Live Activity (user swiped
+ * the card away, or iOS ended it). The live session is already cleared
+ * before callbacks run; the callback only needs to re-derive UI state.
+ * The underlying native listener stays installed for the app lifetime —
+ * removing a callback never uninstalls it, so session cleanup survives
+ * unmount. Returns { remove }.
+ */
+export function subscribeToLaDismissal(callback) {
+  ensureLaListener();
+  if (typeof callback === 'function') laDismissalCallbacks.add(callback);
+  return {
+    remove: () => {
+      laDismissalCallbacks.delete(callback);
+    },
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Change-detection trackers (module scope): updateActivity is throttled by
-// iOS, so we only push when content actually changed, max once per 60s.
+// iOS, so we only push when content actually changed, max once per 30s.
 // ---------------------------------------------------------------------------
 let lastNextStopId = null;
 let lastEtaMs = null;
 let lastDelaySec = null;
 let lastScheduleOnly = null;
+let lastProgress = null;
+let lastEtaMinutes = null;
 let lastUpdateMs = 0;
 
 function resetTrackers() {
@@ -82,6 +167,8 @@ function resetTrackers() {
   lastEtaMs = null;
   lastDelaySec = null;
   lastScheduleOnly = null;
+  lastProgress = null;
+  lastEtaMinutes = null;
   lastUpdateMs = 0;
 }
 
@@ -90,6 +177,8 @@ function initTrackers(state) {
   lastEtaMs = state.etaMs;
   lastDelaySec = state.delaySec;
   lastScheduleOnly = state.showScheduleOnly;
+  lastProgress = state.progress;
+  lastEtaMinutes = state.etaMs != null ? Math.round((state.etaMs - Date.now()) / 60000) : null;
   lastUpdateMs = Date.now();
 }
 
@@ -201,7 +290,7 @@ export function computeTripState(tripId, fromStopId, toStopId, deps = {}) {
   const nextStop = arrived ? null : perStop[nextIndex].stop;
   const stopsRemaining = Math.max(0, stops.length - 1 - nextIndex);
   const denom = Math.max(1, stops.length - 1);
-  const progress = arrived ? 1 : Math.min(1, Math.max(0, nextIndex / denom));
+  const stopCountProgress = arrived ? 1 : Math.min(1, Math.max(0, nextIndex / denom));
 
   const destStop = stops[stops.length - 1];
   const destSchedMs = destStop.arrival_date_time ? Date.parse(destStop.arrival_date_time) : NaN;
@@ -214,6 +303,18 @@ export function computeTripState(tripId, fromStopId, toStopId, deps = {}) {
   }
   const etaMs = Number.isFinite(destSchedMs) ? destSchedMs + (destDelaySec ?? 0) * 1000 : null;
   const pastBackstop = Number.isFinite(destSchedMs) && nowMs > destSchedMs + VANISH_BACKSTOP_MS;
+  // Time-interpolated progress: fraction of elapsed time between boarding
+  // departure and destination arrival, clamped [0,1]. This moves smoothly
+  // as the clock ticks instead of jumping only when a stop passes.
+  // Pre-departure it is 0 (bar stays empty — correct, trip hasn't started).
+  // Falls back to stop-count progress when either endpoint time is
+  // missing (boarding time unknown, or no destination arrival time).
+  const boardingMs = perStop[0].predictedMs;
+  const timeProgress =
+    Number.isFinite(boardingMs) && etaMs != null && etaMs > boardingMs
+      ? Math.min(1, Math.max(0, (nowMs - boardingMs) / (etaMs - boardingMs)))
+      : null;
+  const progress = timeProgress ?? stopCountProgress;
 
   return {
     ok: true,
@@ -239,7 +340,28 @@ export function computeTripState(tripId, fromStopId, toStopId, deps = {}) {
 // ---------------------------------------------------------------------------
 // Content mapping: trip state -> expo-live-activity template
 // ---------------------------------------------------------------------------
-function mapContent(state, lineName, destinationName) {
+/**
+ * Formats the Lock Screen ETA line from a destination arrival epoch:
+ * minutes remaining first (rounded), then the 12-hour arrival clock time
+ * with NO am/pm suffix, e.g. "5 mins to arrival - 12:34". Pure and
+ * exported for tests. Singular "min" at exactly 1 minute ("1 min to
+ * arrival"), "mins" otherwise, so the line matches the approved mockup
+ * format and reads correctly at 1 minute. Returns
+ * null once the rounded minutes would go negative (ETA past) so the
+ * caller omits the line instead of rendering "-1 mins to arrival"
+ * (Harpreet's call, 2026-11-02).
+ */
+export function formatEtaLine(etaMs, nowMs) {
+  const minutes = Math.round((etaMs - nowMs) / 60000);
+  if (minutes < 0) return null;
+  const d = new Date(etaMs);
+  const hour12 = d.getHours() % 12 || 12;
+  const minute = String(d.getMinutes()).padStart(2, '0');
+  const unit = minutes === 1 ? 'min' : 'mins';
+  return `${minutes} ${unit} to arrival - ${hour12}:${minute}`;
+}
+
+export function mapContent(state, lineName, destinationName, nowMs = Date.now()) {
   const dest = destinationName || state.destinationName || 'Destination';
   const line = lineName || 'GO';
   const title = `${line} → ${dest}`;
@@ -248,14 +370,29 @@ function mapContent(state, lineName, destinationName) {
     const stopsWord = state.stopsRemaining === 1 ? 'stop' : 'stops';
     const remainingText = state.stopsRemaining === 0 ? 'final stop' : `${state.stopsRemaining} ${stopsWord}`;
     subtitle = `Next: ${state.nextStopName} • ${remainingText}`;
-    if (state.showScheduleOnly) subtitle += ' • schedule shown';
   } else {
     subtitle = `→ ${dest}`;
   }
+  // ETA line + island countdown only while an arrival time exists and the
+  // trip has not arrived; otherwise the card falls back to today's layout
+  // (title + subtitle + progress bar, no ETA line, no timer date).
+  // The ETA line additionally drops out once the ETA is past (rounded
+  // minutes < 0); the island countdown keeps running to 0:00 in that
+  // state, since the timer date is unchanged.
+  // progressBar carries BOTH date and progress: date drives the Dynamic
+  // Island countdown, progress keeps the Lock Screen bar (the patched
+  // template renders progress whenever it is present, even with a date
+  // set). progressViewTint (in activityConfig) makes the bar white.
+  const hasEta = state.etaMs != null && !state.arrived;
+  const etaLine = hasEta ? formatEtaLine(state.etaMs, nowMs) : null;
   return {
     title,
     subtitle,
-    progressBar: { progress: state.progress },
+    ...(etaLine != null ? { etaLine } : {}),
+    progressBar: {
+      ...(hasEta ? { date: state.etaMs } : {}),
+      progress: state.progress,
+    },
   };
 }
 
@@ -264,6 +401,7 @@ function activityConfig(deepLinkUrl) {
     backgroundColor: GO_GREEN,
     titleColor: WHITE,
     subtitleColor: WHITE,
+    progressViewTint: WHITE,
     timerType: 'digital',
     deepLinkUrl,
   };
@@ -342,7 +480,7 @@ export async function startForTrip({
     };
     await writeSession(session);
 
-    const content = mapContent(state, line, dest);
+    const content = mapContent(state, line, dest, Date.now());
     // The widget template prepends the app scheme to deepLinkUrl, so the
     // card carries the path form only; scheme + path stays byte-identical
     // to buildTripDetailUrl's full form.
@@ -368,6 +506,9 @@ export async function startForTrip({
     session.activityId = activityId;
     await writeSession(session);
     initTrackers(state);
+    // From here on, a dismissal of this activity (swipe-away / iOS end)
+    // must clear the stale live session even if no screen is mounted.
+    ensureLaListener();
 
     return { started: true, activityId };
   } catch {
@@ -398,8 +539,9 @@ export async function getActiveLiveSession() {
 
 /**
  * Recomputes trip state from the feed and pushes to the Live Activity only
- * when content changed (next stop / ETA ±60s / delay / stale flag) and at
- * most once per 60s. Ends the activity on arrival or backstop. Never throws.
+ * when content changed (next stop / ETA ±60s / delay / stale flag /
+ * progress ±0.01 / rounded ETA minutes) and at most once per 30s. Ends the
+ * activity on arrival or backstop. Never throws.
  */
 export async function refreshFromFeed() {
   try {
@@ -422,16 +564,27 @@ export async function refreshFromFeed() {
     const etaChanged =
       (state.etaMs == null) !== (lastEtaMs == null) ||
       (state.etaMs != null && lastEtaMs != null && Math.abs(state.etaMs - lastEtaMs) >= ETA_CHANGE_THRESHOLD_MS);
+    // Rounded ETA minutes: the Lock Screen ETA line shows rounded minutes,
+    // so a minute tick changes visible content even when absolute etaMs is
+    // unchanged (the old absolute-only gate froze the line as the clock
+    // ticked). Compared against the last pushed value, so a throttled push
+    // retries on the next tick rather than being swallowed.
+    const etaMinutes = state.etaMs != null ? Math.round((state.etaMs - nowMs) / 60000) : null;
+    const etaMinutesChanged = etaMinutes !== lastEtaMinutes;
+    const progressChanged =
+      lastProgress == null || Math.abs(state.progress - lastProgress) >= 0.01;
     const changed =
       state.nextStopId !== lastNextStopId ||
       etaChanged ||
+      etaMinutesChanged ||
+      progressChanged ||
       state.delaySec !== lastDelaySec ||
       state.showScheduleOnly !== lastScheduleOnly;
 
     if (!changed) return { refreshed: false, reason: 'unchanged' };
     if (nowMs - lastUpdateMs < UPDATE_THROTTLE_MS) return { refreshed: false, reason: 'throttled' };
 
-    const content = mapContent(state, session.lineName, session.destinationName);
+    const content = mapContent(state, session.lineName, session.destinationName, nowMs);
     try {
       LiveActivity.updateActivity(session.activityId, content);
     } catch {
@@ -443,6 +596,8 @@ export async function refreshFromFeed() {
     lastEtaMs = state.etaMs;
     lastDelaySec = state.delaySec;
     lastScheduleOnly = state.showScheduleOnly;
+    lastProgress = state.progress;
+    lastEtaMinutes = etaMinutes;
     return { refreshed: true };
   } catch {
     return { refreshed: false, reason: 'error' };

@@ -22,10 +22,11 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { MaterialCommunityIcons, MaterialIcons } from '@expo/vector-icons';
 import TripResultCard from '../../components/TripResultCard';
-import { useRouter } from 'expo-router';
+import { useFocusEffect, useRouter } from 'expo-router';
 import { DateTime } from 'luxon';
 
 import { useGtfsData } from '../../contexts/GtfsDataContext';
+import { recordScreenView } from '../../services/usageCounts';
 import {
   ensureSchedulesForDate,
   getTripsFromToForDate,
@@ -203,6 +204,14 @@ function MonthCalendar({
 export default function SearchScreen() {
   const router = useRouter();
   const { ready, error } = useGtfsData();
+
+  // Anonymous usage count: one 'search' screen row per focus. No UI,
+  // no state, no effect on the screen's own work.
+  useFocusEffect(
+    useCallback(() => {
+      recordScreenView('search');
+    }, []),
+  );
 
   const [fromQuery, setFromQuery] = useState('');
   const [fromStop, setFromStop] = useState(null);

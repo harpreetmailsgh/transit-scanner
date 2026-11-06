@@ -148,13 +148,34 @@ function clamp01(value) {
   return n;
 }
 
-function emitProgress(onProgress, message, percent) {
+// Startup step keys for the splash screen (item 4a). The service only
+// tags events it knows; the context maps untagged/legacy messages by
+// text as a fallback. `step` is display metadata only — it never changes
+// what is loaded. Every call is guarded so a progress-reporting failure
+// can never break startup itself.
+const STARTUP_STEP_CHECKING = 'checking';
+const STARTUP_STEP_DOWNLOADING = 'downloading';
+const STARTUP_STEP_LOADING = 'loading';
+
+function emitProgress(onProgress, message, percent, step) {
   if (!onProgress) return;
-  if (Number.isFinite(percent)) {
-    onProgress({ message, percent: clamp01(percent) });
-    return;
+  try {
+    if (Number.isFinite(percent)) {
+      onProgress(
+        step
+          ? { message, percent: clamp01(percent), step }
+          : { message, percent: clamp01(percent) },
+      );
+      return;
+    }
+    if (step) {
+      onProgress({ message, step });
+      return;
+    }
+    onProgress(message);
+  } catch {
+    // Progress reporting must never break the load in progress.
   }
-  onProgress(message);
 }
 
 function isLikelyOutOfMemoryError(err) {
@@ -1520,7 +1541,7 @@ async function persistGtfsCacheInBackground(payload, metaBase) {
 
 async function loadFromCache(onProgress) {
   setStartupPhase('cache-load', 'Loading cached GO Transit data');
-  onProgress?.('Loading cached GO Transit data...');
+  emitProgress(onProgress, 'Loading cached GO Transit data...', undefined, STARTUP_STEP_CHECKING);
   logGtfs('cache: reading file…', { path: CACHE_FILE });
 
   const info = await FileSystem.getInfoAsync(CACHE_FILE);
@@ -1579,13 +1600,23 @@ async function loadFromCache(onProgress) {
 
 async function loadFromHostedSqlite(onProgress, options = {}) {
   setStartupPhase('sqlite-download', 'Preparing hosted schedules database');
-  emitProgress(onProgress, 'Checking schedules database...', 0.02);
+  emitProgress(onProgress, 'Checking schedules database...', 0.02, STARTUP_STEP_CHECKING);
 
   const ensureProgress = (event) => {
     if (!event) return;
     const msg = typeof event === 'string' ? event : event.message;
     const pct = typeof event === 'object' ? Number(event.percent) : NaN;
-    emitProgress(onProgress, msg || 'Downloading schedules database...', Number.isFinite(pct) ? pct : undefined);
+    // Bundle-layer messages: downloads name themselves; anything else
+    // here (version check, validation) is still the checking step.
+    const step = /downloading/i.test(String(msg || ''))
+      ? STARTUP_STEP_DOWNLOADING
+      : STARTUP_STEP_CHECKING;
+    emitProgress(
+      onProgress,
+      msg || 'Downloading schedules database...',
+      Number.isFinite(pct) ? pct : undefined,
+      step,
+    );
   };
 
   // B0 week-gap fix: startup dates are computed before ensure so the
@@ -1626,12 +1657,17 @@ async function loadFromHostedSqlite(onProgress, options = {}) {
     if (!event) return;
     const msg = typeof event === 'string' ? event : event.message;
     const pct = typeof event === 'object' ? Number(event.percent) : NaN;
-    emitProgress(onProgress, msg || 'Loading schedules database...', Number.isFinite(pct) ? pct : undefined);
+    emitProgress(
+      onProgress,
+      msg || 'Loading schedules database...',
+      Number.isFinite(pct) ? pct : undefined,
+      STARTUP_STEP_LOADING,
+    );
   });
 
   await hydrateCoreData(core);
   setStartupPhase('sqlite-load-startup-schedules', 'Loading startup schedules from SQLite');
-  emitProgress(onProgress, 'Loading startup schedules...', 0.55);
+  emitProgress(onProgress, 'Loading startup schedules...', 0.55, STARTUP_STEP_LOADING);
 
   const startupModes = { train: true, bus: true };
   const schedule = await loadHostedSchedulesForDates(
@@ -1642,7 +1678,12 @@ async function loadFromHostedSqlite(onProgress, options = {}) {
       if (!event) return;
       const msg = typeof event === 'string' ? event : event.message;
       const pct = typeof event === 'object' ? Number(event.percent) : NaN;
-      emitProgress(onProgress, msg || 'Loading schedules...', Number.isFinite(pct) ? pct : undefined);
+      emitProgress(
+        onProgress,
+        msg || 'Loading schedules...',
+        Number.isFinite(pct) ? pct : undefined,
+        STARTUP_STEP_LOADING,
+      );
     },
   );
 
@@ -1653,7 +1694,7 @@ async function loadFromHostedSqlite(onProgress, options = {}) {
   if (schedule.trips.length === 0) {
     logGtfs('startup-schedules-empty', { dates: startupDates });
     throw new Error(
-      `Hosted schedules unavailable for ${startupDates.join(', ')} (zero trips loaded).`,
+      `No schedules found for ${startupDates.join(', ')} (no trips for those dates).`,
     );
   }
 
@@ -1663,7 +1704,7 @@ async function loadFromHostedSqlite(onProgress, options = {}) {
 
   schedulesReadyFlag = true;
   options.onSchedulesReady?.();
-  emitProgress(onProgress, 'Schedules database ready', 0.99);
+  emitProgress(onProgress, 'Schedules database ready', 0.99, STARTUP_STEP_LOADING);
 }
 
 async function maybeRefreshGtfsCacheInBackground() {

@@ -26,7 +26,7 @@ import { useFocusEffect, useRouter } from 'expo-router';
 import { DateTime } from 'luxon';
 
 import { useGtfsData } from '../../contexts/GtfsDataContext';
-import { recordScreenView } from '../../services/usageCounts';
+import { recordScreenView, recordSearchQuery, recordSearchResultTap } from '../../services/usageCounts';
 import BusDownloadBanner from '../../components/BusDownloadBanner';
 import {
   ensureSchedulesForDate,
@@ -456,19 +456,26 @@ export default function SearchScreen() {
     setToSuggestions(matches);
   }, [ready, toQuery, toStop, selectedModes, stopMatchesSelectedModes]);
 
+  // Anonymous usage counts: one search_queries row with the TYPED query
+  // plus one station result-tap row per suggestion pick, recorded
+  // BEFORE the field is overwritten with the picked stop's name.
   const selectFrom = useCallback((stop) => {
+    recordSearchQuery({ queryText: fromQuery });
+    recordSearchResultTap('station');
     setFromStop(stop);
     setFromQuery(stop.stop_name);
     setFromSuggestions([]);
     Keyboard.dismiss();
-  }, []);
+  }, [fromQuery]);
 
   const selectTo = useCallback((stop) => {
+    recordSearchQuery({ queryText: toQuery });
+    recordSearchResultTap('station');
     setToStop(stop);
     setToQuery(stop.stop_name);
     setToSuggestions([]);
     Keyboard.dismiss();
-  }, []);
+  }, [toQuery]);
 
   const clearFrom = useCallback(() => {
     setIsComputing(true);
@@ -689,7 +696,9 @@ export default function SearchScreen() {
         fromStop={fromStop}
         toStop={toStop}
         showPlatform={false}
-        onPress={() =>
+        onPress={() => {
+          // Anonymous usage count: one trip result-tap row per card tap.
+          recordSearchResultTap('trip');
           router.push({
             pathname: '/trip-detail',
             params: {
@@ -713,8 +722,8 @@ export default function SearchScreen() {
                 return 'on-time';
               })(),
             },
-          })
-        }
+          });
+        }}
       />
     ),
     [fromStop, toStop, router],

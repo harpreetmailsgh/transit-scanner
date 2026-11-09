@@ -34,6 +34,7 @@ import { evaluateAlertsFromFeed, resumeRideTracking } from '../services/rideTrac
 import { reconcileOnLaunch, refreshFromFeed } from '../services/liveActivityService';
 import { recordStartupTiming, reportStartupTiming } from '../services/startupTelemetry';
 import { recordAppOpen } from '../services/usageCounts';
+import { getSavedTrips } from '../services/savedTripsService';
 
 /**
  * If loading takes longer than this, we fail with a visible error.
@@ -491,8 +492,20 @@ export function GtfsDataProvider({ children }) {
             reportStartupTiming(timing).catch(() => {});
             // Anonymous usage count: one 'open' row per launch, queued
             // with the other counts. Same guard as the timings report,
-            // so a launch is counted exactly once.
-            recordAppOpen();
+            // so a launch is counted exactly once. The row also carries
+            // the saved-trips count (a single number — the app has no
+            // saved-stops feature, Saved holds saved trips). The read
+            // is fail-silent: any failure passes null and the row is
+            // recorded without the count. Ready is already set above,
+            // so this short read never delays the screen.
+            let savedCount = null;
+            try {
+              const savedTrips = await getSavedTrips();
+              savedCount = Array.isArray(savedTrips) ? savedTrips.length : null;
+            } catch {
+              savedCount = null;
+            }
+            recordAppOpen(savedCount);
           }
           // Post-ready next-week prefetch, BOTH modes: fire-and-forget,
           // non-blocking, catch-all. It never touches ready/error state.

@@ -34,7 +34,7 @@ import { evaluateAlertsFromFeed, resumeRideTracking } from '../services/rideTrac
 import { reconcileOnLaunch, refreshFromFeed } from '../services/liveActivityService';
 import { recordStartupTiming, reportStartupTiming } from '../services/startupTelemetry';
 import { recordAppOpen } from '../services/usageCounts';
-import { getSavedTrips } from '../services/savedTripsService';
+import { countSavedTrips } from '../services/savedTripsService';
 
 /**
  * If loading takes longer than this, we fail with a visible error.
@@ -494,14 +494,15 @@ export function GtfsDataProvider({ children }) {
             // with the other counts. Same guard as the timings report,
             // so a launch is counted exactly once. The row also carries
             // the saved-trips count (a single number — the app has no
-            // saved-stops feature, Saved holds saved trips). The read
-            // is fail-silent: any failure passes null and the row is
-            // recorded without the count. Ready is already set above,
-            // so this short read never delays the screen.
+            // saved-stops feature, Saved holds saved trips). The count
+            // is a read-only read: countSavedTrips never writes, so a
+            // launch cannot rewrite or clobber the saved-trips file.
+            // The read is fail-silent: any failure passes null and the
+            // row is recorded without the count. Ready is already set
+            // above, so this short read never delays the screen.
             let savedCount = null;
             try {
-              const savedTrips = await getSavedTrips();
-              savedCount = Array.isArray(savedTrips) ? savedTrips.length : null;
+              savedCount = await countSavedTrips();
             } catch {
               savedCount = null;
             }

@@ -175,6 +175,29 @@ export async function getSavedTrips() {
   return normalized;
 }
 
+/**
+ * Read-only saved-trips count for the launch usage row. Reads the file,
+ * parses it, and counts the normalized, deduped entries in memory — it
+ * NEVER writes, so a launch cannot rewrite, truncate, or race-clobber
+ * the user's saved-trips file. Fail-silent: returns null on any failure
+ * (missing/corrupt file, non-array content, normalize error) so the
+ * caller records the open without a count. A file that simply does not
+ * exist yet means zero saved trips, not a failure.
+ */
+export async function countSavedTrips() {
+  try {
+    const info = await FileSystem.getInfoAsync(SAVED_TRIPS_FILE);
+    if (!info.exists) return 0;
+
+    const json = await FileSystem.readAsStringAsync(SAVED_TRIPS_FILE);
+    const parsed = JSON.parse(json);
+    if (!Array.isArray(parsed)) return null;
+    return normalizeAndDedupe(parsed).length;
+  } catch {
+    return null;
+  }
+}
+
 export async function saveTrip(input) {
   const key = buildTripKey(input);
   if (!key) return getSavedTrips();

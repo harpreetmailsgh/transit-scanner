@@ -25,6 +25,7 @@ import {
   getDeparturesForStop,
   getPlatformForTrip,
 } from './gtfsService';
+import { recordLoadFailure } from './usageCounts';
 
 const FeedMessage = GtfsRoot.transit_realtime.FeedMessage;
 
@@ -288,7 +289,16 @@ async function refreshAllFeeds() {
     if (vehFailure) failures.push(vehFailure);
 
     if (failures.length > 0) {
-      realtimeLastError = failures.join(' | ').slice(0, 200);
+      // One anonymous usage-count row per NEW live-feed failure: on the
+      // null → error transition, or when the error string changes. A
+      // feed that stays broken across 30s polls records once, not every
+      // poll; a fully successful refresh clears the error, so a later
+      // re-failure records again.
+      const nextError = failures.join(' | ').slice(0, 200);
+      if (realtimeLastError !== nextError) {
+        recordLoadFailure('live');
+      }
+      realtimeLastError = nextError;
     } else {
       realtimeLastError = null;
     }

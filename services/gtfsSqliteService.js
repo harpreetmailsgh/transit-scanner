@@ -3,6 +3,7 @@ import * as SQLite from 'expo-sqlite';
 import Constants from 'expo-constants';
 import { Platform } from 'react-native';
 import { DateTime } from 'luxon';
+import { recordLoadFailure } from './usageCounts';
 
 const DEFAULT_TIMEOUT_MS = 30000;
 const CHECK_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -875,6 +876,11 @@ async function downloadAndValidateWeek(manifestWeek, onProgress) {
       }
       return weekEntryFromManifest(manifestWeek);
     } catch (err) {
+      // One anonymous usage-count row per failed week-download attempt
+      // (train or bus — this catch is the single failure site for both).
+      // A coverage gap ("No week published covering …") never reaches
+      // here, so it is not recorded as a download failure.
+      recordLoadFailure('schedules');
       if (isBus) {
         updateBusDownloadState({
           status: 'error',

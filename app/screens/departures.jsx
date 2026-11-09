@@ -22,7 +22,7 @@ import {
 } from '../../services/gtfsSqliteService';
 import { getLiveDepartures, getRealtimeDiagnostics, subscribeRealtimeDiagnostics } from '../../services/gtfsRealtimeService';
 import { maybeAskForReview } from '../../services/reviewPrompt';
-import { recordScreenView, recordStationCheck } from '../../services/usageCounts';
+import { recordLiveFreshness, recordScreenView, recordStationCheck } from '../../services/usageCounts';
 import { DateTime } from 'luxon';
 
 const GO_GREEN = '#00853F';
@@ -40,6 +40,10 @@ export default function DeparturesScreen() {
   // load effect below is not counted as a second view. A remount (back
   // out and back in, or a different station) resets it and counts again.
   const lastStationCheckRef = useRef('');
+  // Last station view already freshness-counted, so later 30s ticks for
+  // the same view record nothing. A remount (back out and back in, or a
+  // different station) resets it and counts the new view once.
+  const lastFreshnessCheckRef = useRef('');
   const [departures, setDepartures] = useState([]);
   const [loading, setLoading] = useState(true);
   const [busDownloadState, setBusDownloadState] = useState(() => getBusDownloadState());
@@ -126,7 +130,7 @@ export default function DeparturesScreen() {
       const checkKey = `${stopId}|${stopFilter}`;
       if (lastStationCheckRef.current !== checkKey) {
         lastStationCheckRef.current = checkKey;
-        recordStationCheck({ stationName: stopName, lineName: deps[0]?.lineName });
+        recordStationCheck({ stationName: stopName, lineName: deps[0]?.lineName, mode: departuresMode });
         recordScreenView('departures');
       }
     }
@@ -141,7 +145,20 @@ export default function DeparturesScreen() {
     if (realtimeVersion === 0 || !stopId) return;
     const deps = getLiveDepartures(stopId, 100, { mode: departuresMode });
     setDepartures(Array.isArray(deps) ? deps : []);
-  }, [realtimeVersion, stopId, departuresMode]);
+    // Anonymous usage counts, once per view: the first time the live feed
+    // state is known for this station view, record whether it was fresh
+    // (updated within 5 min — the same rule as the live footer) or stale.
+    // Keyed to the station view, so later 30s ticks record nothing. A
+    // feed that never loads records nothing.
+    const updatedMs = realtimeDiag?.lastUpdatedMs || null;
+    if (updatedMs) {
+      const checkKey = `${stopId}|${stopFilter}`;
+      if (lastFreshnessCheckRef.current !== checkKey) {
+        lastFreshnessCheckRef.current = checkKey;
+        recordLiveFreshness(Date.now() - updatedMs <= 5 * 60 * 1000);
+      }
+    }
+  }, [realtimeVersion, realtimeDiag, stopId, stopFilter, departuresMode]);
 
   // One-line live-data readout for the phone test: last refresh time,
   // trips carrying live times, and the last feed error. It reads:

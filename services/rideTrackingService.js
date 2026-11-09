@@ -36,6 +36,7 @@ import {
   getActiveLiveSession,
   refreshFromFeed as refreshLiveActivityFromFeed,
 } from './liveActivityService';
+import { recordAlertFired } from './usageCounts';
 
 const RIDE_SESSION_FILE = `${FileSystem.documentDirectory}active-ride-v1.json`;
 const LOCATION_TASK_NAME = 'transitscanner-active-ride-location-task';
@@ -670,6 +671,10 @@ export async function evaluateAlertsFromFeed() {
         session.lastNotifiedStopId !== finalStopId
       ) {
         await sendRideNotification('Track my Trip', `Up next ${finalStopName}`);
+        // One anonymous usage-count row per buzz fired. This is the only
+        // fire in the engine, and the session ends immediately below, so
+        // it cannot refire.
+        recordAlertFired();
         session.lastNotifiedStopId = finalStopId;
         debugLog('Final-stop alert fired', { tripId: session.tripId, nextStopId: finalStopId });
       }

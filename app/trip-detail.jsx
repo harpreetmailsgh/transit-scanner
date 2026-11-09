@@ -28,7 +28,7 @@ import TripResultCard from '../components/TripResultCard';
 import { DateTime } from 'luxon';
 
 import { useGtfsData } from '../contexts/GtfsDataContext';
-import { recordScreenView } from '../services/usageCounts';
+import { recordScreenView, recordTrackTap } from '../services/usageCounts';
 import { getTripSegmentServicePattern, getTripStops } from '../services/gtfsService';
 import { getPlatformMatchForStop, getStopNextService } from '../services/metrolinxApiService';
 import { getDelayForStop } from '../services/gtfsRealtimeService';
@@ -891,12 +891,16 @@ export default function TripDetailScreen() {
         // already replaced the old session before the outcome is known,
         // so a denied replacement lands at Default rather than restoring
         // the previous session (no snapshot-restore is in scope).
-        if (
+        // One anonymous usage-count row per tap that successfully arms
+        // tracking: armed, and the denial rollback below did NOT run.
+        // The rollback condition is named once so the record rule and
+        // the rollback can never drift apart.
+        const denialRolledBack =
           alertsRes &&
           alertsRes.armed &&
           !alertsRes.backgroundCapabilityUnavailable &&
-          (alertsRes.alertState === 'off' || alertsRes.alertState === 'limited')
-        ) {
+          (alertsRes.alertState === 'off' || alertsRes.alertState === 'limited');
+        if (denialRolledBack) {
           try {
             await stopTracking();
           } catch {
@@ -907,6 +911,8 @@ export default function TripDetailScreen() {
           } catch {
             // stopAlerts never throws by contract; stay defensive anyway.
           }
+        } else if (alertsRes && alertsRes.armed) {
+          recordTrackTap();
         }
       }
       await refreshTrackingState();

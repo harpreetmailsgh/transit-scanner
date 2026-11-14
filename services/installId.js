@@ -27,6 +27,11 @@ const INSTALL_ID_KEY = 'transit-scanner-install-id.v1';
 // the same ID without another AsyncStorage read.
 let cachedInstallId = null;
 
+// In-flight promise: concurrent callers share one load/generate cycle,
+// so two calls racing on a cold store cannot each generate a different
+// ID. Cleared on settle (success and failure alike).
+let installIdInFlight = null;
+
 /**
  * Generates a UUID-v4-shaped string (xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx,
  * version nibble 4, variant nibble 8/9/a/b). Pure — no storage, no
@@ -66,25 +71,32 @@ export function generateInstallId() {
  * Loads the install ID from AsyncStorage, generating and storing one on
  * first launch. Returns the ID string, or null on any failure. Never
  * throws. Safe to call fire-and-forget at startup; concurrent calls
- * share the in-memory cache once it is set.
+ * share one in-flight load/generate cycle, and once the ID is cached
+ * every later caller gets it directly.
  */
 export async function ensureInstallId() {
   if (cachedInstallId) return cachedInstallId;
-  try {
-    const stored = await AsyncStorage.getItem(INSTALL_ID_KEY);
-    const existing = typeof stored === 'string' ? stored.trim() : '';
-    if (existing) {
-      cachedInstallId = existing;
+  if (installIdInFlight) return installIdInFlight;
+  installIdInFlight = (async () => {
+    try {
+      const stored = await AsyncStorage.getItem(INSTALL_ID_KEY);
+      const existing = typeof stored === 'string' ? stored.trim() : '';
+      if (existing) {
+        cachedInstallId = existing;
+        return cachedInstallId;
+      }
+      const generated = generateInstallId();
+      await AsyncStorage.setItem(INSTALL_ID_KEY, generated);
+      cachedInstallId = generated;
       return cachedInstallId;
+    } catch {
+      // AsyncStorage unavailable — telemetry goes out without an ID.
+      return null;
+    } finally {
+      installIdInFlight = null;
     }
-    const generated = generateInstallId();
-    await AsyncStorage.setItem(INSTALL_ID_KEY, generated);
-    cachedInstallId = generated;
-    return cachedInstallId;
-  } catch {
-    // AsyncStorage unavailable — telemetry goes out without an ID.
-    return null;
-  }
+  })();
+  return installIdInFlight;
 }
 
 /** Sync read of the cached ID, or null if it has not loaded yet. */

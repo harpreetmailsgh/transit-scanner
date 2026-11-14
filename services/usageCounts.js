@@ -18,9 +18,20 @@
  * stale), 'load_failed' (schedules or live data failed to load;
  * screen_name 'schedules' or 'live').
  *
- * What is NEVER in any payload: no id of any kind (no device id, no user
- * id, no install id), no timestamp, no name, email, account, location,
- * GPS, contacts, age, or gender. Favourites and saved trips are never
+ * What IS in a payload now (added for backlog #104, so distinct active
+ * users can be counted from our own telemetry):
+ * - install_id: a random UUID-v4-shaped string, one per app install
+ *   (services/installId.js). Random, not derived from the device, user,
+ *   or account; a reinstall gets a fresh ID. Rows enqueued before the
+ *   ID has loaded carry no install_id — the column is nullable.
+ * - event_at: the time the event happened (ISO string), stamped when
+ *   the row is queued — event time, never flush time.
+ * - from_station / to_station: on search rows only, the GTFS stop_id
+ *   strings of the picked origin / destination (never names, never
+ *   lat/lon). Only set when a station was actually picked; a side not
+ *   chosen yet is left out, never invented.
+ * There is still no device ID, user ID, name, email, account, location,
+ * GPS, contacts, age, or gender in any payload. Favourites and saved trips are never
  * read here and never sent — only the COUNT of saved trips (a single
  * number, never which trips) is included in the 'open' row, and only
  * when the caller passes it. Search queries are the typed words only,
@@ -42,6 +53,7 @@
  */
 
 import { createClient } from '@supabase/supabase-js';
+import { getInstallId } from './installId';
 
 const SUPABASE_URL = (process.env.EXPO_PUBLIC_SUPABASE_URL || '').trim();
 const SUPABASE_ANON_KEY = (process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY || '').trim();
@@ -130,6 +142,13 @@ function ensureFlushTimer() {
 function enqueue(table, row) {
   if (!isConfigured()) return;
   if (queue.length >= MAX_QUEUE) return;
+  // Anonymous install ID: attached when it has loaded; rows enqueued
+  // before that carry none (nullable column). Event time is stamped
+  // here at enqueue time — never flush time — unless the caller already
+  // set one.
+  const installId = getInstallId();
+  if (installId) row.install_id = installId;
+  if (!row.event_at) row.event_at = new Date().toISOString();
   queue.push({ table, row });
   ensureFlushTimer();
   if (queue.length >= FLUSH_SIZE) {
@@ -232,13 +251,17 @@ export function normalizeSearchQuery(text) {
  * One search_queries row for a picked suggestion: the words the user
  * typed before picking, normalized. Only suggestion picks call this —
  * there is no submit handler for keyboard Enter. Empty after trim
- * records nothing.
+ * records nothing. Optional fromStation/toStation are GTFS stop_id
+ * strings (or null); set on the row only when a non-empty string.
  */
-export function recordSearchQuery({ queryText } = {}) {
+export function recordSearchQuery({ queryText, fromStation, toStation } = {}) {
   if (!isConfigured()) return;
   const query = normalizeSearchQuery(queryText);
   if (!query) return;
-  enqueue(SEARCH_QUERIES_TABLE, { query_text: query });
+  const row = { query_text: query };
+  if (typeof fromStation === 'string' && fromStation) row.from_station = fromStation;
+  if (typeof toStation === 'string' && toStation) row.to_station = toStation;
+  enqueue(SEARCH_QUERIES_TABLE, row);
 }
 
 /** One app_usage row per Track tap on the trip-detail screen. */
@@ -256,12 +279,16 @@ export function recordAlertFired() {
 /**
  * One app_usage row per search result tap: a picked station suggestion
  * ('station') or a trip result card ('trip'). Any other value records
- * nothing.
+ * nothing. Optional fromStation/toStation are GTFS stop_id strings
+ * (or null); set on the row only when a non-empty string.
  */
-export function recordSearchResultTap(resultType) {
+export function recordSearchResultTap(resultType, { fromStation, toStation } = {}) {
   if (!isConfigured()) return;
   if (resultType !== 'station' && resultType !== 'trip') return;
-  enqueue(APP_USAGE_TABLE, { event_type: 'search_result_tap', screen_name: resultType });
+  const row = { event_type: 'search_result_tap', screen_name: resultType };
+  if (typeof fromStation === 'string' && fromStation) row.from_station = fromStation;
+  if (typeof toStation === 'string' && toStation) row.to_station = toStation;
+  enqueue(APP_USAGE_TABLE, row);
 }
 
 /** One app_usage row per departures live-data check: fresh or stale. */

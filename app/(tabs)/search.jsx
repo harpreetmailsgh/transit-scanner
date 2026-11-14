@@ -460,22 +460,22 @@ export default function SearchScreen() {
   // plus one station result-tap row per suggestion pick, recorded
   // BEFORE the field is overwritten with the picked stop's name.
   const selectFrom = useCallback((stop) => {
-    recordSearchQuery({ queryText: fromQuery });
-    recordSearchResultTap('station');
+    recordSearchQuery({ queryText: fromQuery, fromStation: stop.stop_id, toStation: toStop?.stop_id ?? null });
+    recordSearchResultTap('station', { fromStation: stop.stop_id, toStation: toStop?.stop_id ?? null });
     setFromStop(stop);
     setFromQuery(stop.stop_name);
     setFromSuggestions([]);
     Keyboard.dismiss();
-  }, [fromQuery]);
+  }, [fromQuery, toStop]);
 
   const selectTo = useCallback((stop) => {
-    recordSearchQuery({ queryText: toQuery });
-    recordSearchResultTap('station');
+    recordSearchQuery({ queryText: toQuery, fromStation: fromStop?.stop_id ?? null, toStation: stop.stop_id });
+    recordSearchResultTap('station', { fromStation: fromStop?.stop_id ?? null, toStation: stop.stop_id });
     setToStop(stop);
     setToQuery(stop.stop_name);
     setToSuggestions([]);
     Keyboard.dismiss();
-  }, [toQuery]);
+  }, [toQuery, fromStop]);
 
   const clearFrom = useCallback(() => {
     setIsComputing(true);
@@ -698,7 +698,7 @@ export default function SearchScreen() {
         showPlatform={false}
         onPress={() => {
           // Anonymous usage count: one trip result-tap row per card tap.
-          recordSearchResultTap('trip');
+          recordSearchResultTap('trip', { fromStation: fromStop.stop_id, toStation: toStop?.stop_id ?? null });
           router.push({
             pathname: '/trip-detail',
             params: {

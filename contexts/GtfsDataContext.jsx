@@ -34,6 +34,7 @@ import { evaluateAlertsFromFeed, resumeRideTracking } from '../services/rideTrac
 import { reconcileOnLaunch, refreshFromFeed } from '../services/liveActivityService';
 import { recordStartupTiming, reportStartupTiming } from '../services/startupTelemetry';
 import { recordAppOpen } from '../services/usageCounts';
+import { ensureInstallId } from '../services/installId';
 import { countSavedTrips } from '../services/savedTripsService';
 
 /**
@@ -312,6 +313,10 @@ export function GtfsDataProvider({ children }) {
     syncServiceDiagnostics();
 
     const run = async () => {
+      // Anonymous install ID: kick off the AsyncStorage read first, so
+      // it finishes well before ready. Fire-and-forget — never awaited,
+      // never delays the screen or the ready path.
+      ensureInstallId().catch(() => {});
       resumeRideTracking().catch(() => {
         // Keep app usable even if background ride tracking resume fails.
       });

@@ -6,11 +6,15 @@
  *
  * After the GTFS startup sequence completes, reports one anonymous timing row
  * to the `startup_timings` table in the dedicated "Transit Scanner" project:
- *   { app_version, platform, total_ms, stops_ms, schedules_ms }
+ *   { app_version, platform, total_ms, stops_ms, schedules_ms,
+ *     install_id, event_at }
  * (timing_date is left to the server default — never sent.)
  *
- * There is NO id of any kind in the payload: no device id, no user id, no
- * install id. Nothing here points at any other project's table.
+ * The payload now carries install_id — a random per-install value (UUID-shaped,
+ * one per install, resets on delete), NOT a device id or user id — plus
+ * event_at (the launch-ready time). There is still no device id, no user id,
+ * no name, no account, and no GPS/location in the payload. Nothing here
+ * points at any other project's table.
  *
  * Everything here is fail-silent by design:
  * - If EXPO_PUBLIC_SUPABASE_URL / EXPO_PUBLIC_SUPABASE_ANON_KEY are unset,
@@ -22,6 +26,7 @@
 import { Platform } from 'react-native';
 import Constants from 'expo-constants';
 import { createClient } from '@supabase/supabase-js';
+import { ensureInstallId } from './installId';
 
 const SUPABASE_URL = (process.env.EXPO_PUBLIC_SUPABASE_URL || '').trim();
 const SUPABASE_ANON_KEY = (process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY || '').trim();
@@ -83,13 +88,19 @@ export async function reportStartupTiming({ totalMs, stopsMs, schedulesMs } = {}
       const client = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
         auth: { persistSession: false },
       });
-      const { error } = await client.from(TIMINGS_TABLE).insert({
+      const installId = await ensureInstallId().catch(() => null);
+      const row = {
         app_version: getAppVersion(),
         platform: String(Platform.OS || 'unknown'),
         total_ms: toMs(totalMs),
         stops_ms: toMs(stopsMs),
         schedules_ms: toMs(schedulesMs),
-      });
+        event_at: new Date().toISOString(),
+      };
+      if (typeof installId === 'string' && installId.length > 0) {
+        row.install_id = installId;
+      }
+      const { error } = await client.from(TIMINGS_TABLE).insert(row);
       return error ? null : true;
     } catch {
       return null;

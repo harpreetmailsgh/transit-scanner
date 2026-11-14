@@ -511,6 +511,7 @@ export function GtfsDataProvider({ children }) {
             } catch {
               savedCount = null;
             }
+            await ensureInstallId().catch(() => {});
             recordAppOpen(savedCount);
           }
           // Post-ready next-week prefetch, BOTH modes: fire-and-forget,

@@ -1,15 +1,15 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as StoreReview from 'expo-store-review';
 
-const VIEW_COUNT_KEY = 'ts:departureViews';
+const VIEW_COUNT_KEY = 'ts:searchViews';
 const ASKED_KEY = 'ts:reviewAsked';
-// Ask once the user has seen departures a few times (an engaged user,
-// not a first-timer). Apple additionally throttles the native prompt
+// Ask once the user has seen the search screen a few times (an engaged
+// user, not a first-timer). Apple additionally throttles the native prompt
 // itself, so this can never spam.
 const VIEWS_BEFORE_ASK = 4;
 
 /**
- * Call after departures have successfully loaded for a stop.
+ * Call when the search screen is shown (one view per focus).
  * Shows the native iOS/Android in-app review prompt at most once ever.
  */
 export async function maybeAskForReview() {

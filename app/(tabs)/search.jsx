@@ -27,6 +27,7 @@ import { DateTime } from 'luxon';
 
 import { useGtfsData } from '../../contexts/GtfsDataContext';
 import { recordScreenView, recordSearchQuery, recordSearchResultTap } from '../../services/usageCounts';
+import { maybeAskForReview } from '../../services/reviewPrompt';
 import BusDownloadBanner from '../../components/BusDownloadBanner';
 import {
   ensureSchedulesForDate,
@@ -219,6 +220,7 @@ export default function SearchScreen() {
   useFocusEffect(
     useCallback(() => {
       recordScreenView('search');
+      maybeAskForReview();
     }, []),
   );
 

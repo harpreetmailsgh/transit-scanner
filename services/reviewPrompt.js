@@ -1,5 +1,12 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import * as StoreReview from 'expo-store-review';
+
+// NOTE: expo-store-review is NOT imported at module level on purpose.
+// Its native entry calls requireNativeModule('ExpoStoreReview') at load
+// time, which throws synchronously on builds that predate the module
+// (e.g. the 1.1 store build). Requiring it lazily inside
+// maybeAskForReview() puts that throw inside the try/catch below, so a
+// missing native module degrades to "no prompt" instead of crashing the
+// import of this module (and, from the search screen, every Search tap).
 
 const VIEW_COUNT_KEY = 'ts:searchViews';
 const ASKED_KEY = 'ts:reviewAsked';
@@ -20,6 +27,10 @@ export async function maybeAskForReview() {
 
     if (views < VIEWS_BEFORE_ASK) return;
     if (await AsyncStorage.getItem(ASKED_KEY)) return;
+
+    // Lazy require (see note at the top of this file): throws here when
+    // the native module is absent, and lands in the catch below.
+    const StoreReview = require('expo-store-review');
 
     if (await StoreReview.isAvailableAsync()) {
       await StoreReview.requestReview();

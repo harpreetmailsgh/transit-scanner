@@ -21,7 +21,6 @@ import {
   subscribeBusDownloadState,
 } from '../../services/gtfsSqliteService';
 import { getLiveDepartures, getRealtimeDiagnostics, subscribeRealtimeDiagnostics } from '../../services/gtfsRealtimeService';
-import { maybeAskForReview } from '../../services/reviewPrompt';
 import { recordLiveFreshness, recordScreenView, recordStationCheck } from '../../services/usageCounts';
 import { DateTime } from 'luxon';
 
@@ -120,7 +119,6 @@ export default function DeparturesScreen() {
     setDepartures(Array.isArray(deps) ? deps : []);
     setLoading(false);
     if (Array.isArray(deps) && deps.length > 0) {
-      maybeAskForReview();
       // Anonymous usage counts, once per view of this station: a
       // station_checks row (stop name from params + first departure's
       // line name) and a 'departures' screen row. Deliberately NOT in
@@ -138,8 +136,8 @@ export default function DeparturesScreen() {
 
   // Realtime-tick recompute only: refreshes the list when a poll settles
   // (realtimeVersion bump from the subscription above). Deliberately
-  // separate from the effect above — it must NOT call maybeAskForReview
-  // (that counts departure views, and a 30s tick is not a new view) and
+  // separate from the effect above — it must NOT count a new view
+  // (a 30s tick is not a new view) and
   // must NOT touch `loading` (no spinner flash every 30s).
   useEffect(() => {
     if (realtimeVersion === 0 || !stopId) return;
